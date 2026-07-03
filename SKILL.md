@@ -28,7 +28,9 @@ The work is done by a bundled engine, `scripts/sessions.py`. Always use it
 rather than reading raw `.jsonl` files: transcripts are routinely tens of MB
 and will blow your context, and they are conversation **trees** — a single file
 mixes the live conversation with abandoned/rewound branches, which the engine
-untangles for you.
+untangles for you. The engine also searches durable memory files and can
+prepare a Graphify-ready corpus so long-running project context survives across
+agent sessions.
 
 ## The engine
 
@@ -38,7 +40,7 @@ Run with the Python on the machine (`python` or `python3`; no third-party deps):
 python <skill_dir>/scripts/sessions.py <command> ...
 ```
 
-Three commands:
+Core transcript commands:
 
 | Command | Purpose |
 |---|---|
@@ -46,9 +48,52 @@ Three commands:
 | `search QUERY [--project P] [--limit N]` | Find sessions by content. Searches prose **and tool calls** (file paths, commands) **and tool output** — so an artifact named only inside an `Edit`/`Bash`/`Glob` call is still found. Token- and separator-normalized, ranked by relevance. |
 | `show SESSION [--mode briefing\|full\|prompts] [--all-branches] [--include-subagents] [--max-chars N]` | Condensed transcript of one session. `SESSION` is a session id, a partial id, or a file path. |
 
+Durable-memory commands:
+
+| Command | Purpose |
+|---|---|
+| `memory-search QUERY [--project P] [--limit N]` | Search curated durable memory before raw transcripts: Codex memory registry/rollout summaries, Claude project memory files, and project briefing/daily-memory files. Use this first for branch roles, current project state, daily recaps, or "what should future agents remember?" |
+| `memory-corpus [PROJECT] [--out DIR] [--session-limit N] [--run-graphify]` | Write a Graphify-ready text corpus containing durable memories plus a generated session index. Raw JSONL transcripts are deliberately excluded. Default output is `~/.codex/memories/graphify-corpus/<project>/`. |
+| `memory-graph [PROJECT] [--corpus-dir DIR]` | Build a local Graphify-compatible `graphify-out/graph.json` from the curated memory corpus without API keys. This deterministic fallback is useful when `graphify extract` cannot semantically process Markdown because no LLM backend is configured. |
+| `memory-query QUERY [--project P] [--graph-dir DIR] [--budget N] [--dfs]` | Query an existing Graphify memory graph if `graphify-out/graph.json` and the Graphify CLI are present. Falls back to `memory-search` when no graph is available. |
+
 ## Workflow
 
 Create a todo per step if the task is non-trivial.
+
+**0 — Check durable memory first when appropriate.** If the user asks about
+existing project knowledge, branch ownership, daily work logs, durable memory,
+or a current fork point, run `memory-search "<their words>" --project <project>`
+before `search`. For Trellis/Radxa/PERIPH work, this usually surfaces the
+authoritative briefing or memory note faster than transcript search.
+
+If a Graphify memory corpus has already been built, use:
+
+```
+memory-query "Radxa branch roles" --project Trellis
+```
+
+If it says no graph exists, either use the fallback results or refresh the
+corpus with:
+
+```
+memory-corpus Trellis
+memory-graph Trellis
+```
+
+Then query it through Graphify if the CLI is installed:
+
+```
+memory-query "Radxa branch roles" --project Trellis
+```
+
+Use `graphify extract ...` only when an LLM backend/API key is available for
+Markdown semantic extraction. Without that backend, use `memory-graph` so the
+query surface still exists and stays deterministic.
+
+Do not graphify raw transcript `.jsonl` files by default; graph the curated
+durable-memory corpus instead. Raw transcripts are still available through
+`list`, `search`, and `show` when the memory layer is insufficient.
 
 **1 — Identify the session.** Pick the path of least resistance:
 - The user gave a session id or file path → go straight to `show`.

@@ -23,14 +23,22 @@ Subcommands:
     list    [PROJECT] [--limit N]            recent sessions, newest first
     search  QUERY [--project P] [--limit N]  find sessions by content/title
     show    SESSION [--mode MODE] [...]       condensed transcript of one session
+    memory-search QUERY [--project P]         search durable memory files
+    memory-corpus [PROJECT]                   build a Graphify-ready memory corpus
+    memory-graph [PROJECT]                    build a local Graphify-compatible memory graph
+    memory-query QUERY [--project P]          query memory graph if present, else search
 
 Run with no args for help.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Transcripts contain arbitrary Unicode (paths, prose, symbols). On Windows the
@@ -366,6 +374,450 @@ def filter_files(files, project):
 
 
 # --------------------------------------------------------------------------
+# Durable memory and Graphify corpus helpers
+# --------------------------------------------------------------------------
+def _read_text(path, max_chars=None):
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeError):
+        return ""
+    if max_chars is not None and len(text) > max_chars:
+        return text[:max_chars]
+    return text
+
+
+def _slug(s, default="item"):
+    s = norm(str(s))
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s[:80] or default
+
+
+def _memory_root():
+    return Path.home() / ".codex" / "memories"
+
+
+def _claude_projects_root():
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    root = Path(cfg) if cfg else (Path.home() / ".claude")
+    return root / "projects"
+
+
+def _project_path(project):
+    if not project:
+        return None
+    p = Path(project)
+    if p.exists():
+        return p
+    p = Path.home() / "Desktop" / project
+    if p.exists():
+        return p
+    return None
+
+
+def _project_relevant(path, text, project):
+    if not project:
+        return True
+    qn = norm(project)
+    if qn in norm(path):
+        return True
+    return qn in norm(text)
+
+
+def durable_memory_files(project=None):
+    """Curated memory files worth searching before raw transcript spelunking.
+
+    This intentionally indexes durable summaries, hand-written project memories,
+    and daily recap files. It does not include raw session JSONL transcripts by
+    default: those stay behind the existing list/search/show commands.
+    """
+    out = []
+    seen = set()
+
+    def add(path, kind):
+        p = Path(path)
+        if not p.is_file():
+            return
+        try:
+            key = str(p.resolve()).lower()
+        except OSError:
+            key = str(p).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append((p, kind))
+
+    codex_root = _memory_root()
+    if codex_root.exists():
+        for name in (
+            "memory_summary.md",
+            "MEMORY.md",
+            "raw_memories.md",
+            "phase2_workspace_diff.md",
+        ):
+            add(codex_root / name, "codex-memory")
+        for sub in ("rollout_summaries", "extensions/ad_hoc/notes"):
+            d = codex_root / sub
+            if d.exists():
+                for f in sorted(d.glob("*.md")):
+                    if _project_relevant(f, _read_text(f, max_chars=6000), project):
+                        add(f, "codex-rollout" if sub == "rollout_summaries" else "codex-note")
+
+    claude_root = _claude_projects_root()
+    if claude_root.exists():
+        for memdir in sorted(claude_root.glob("*/memory")):
+            marker = memdir.parent.name + "\n" + _read_text(memdir / "MEMORY.md", max_chars=6000)
+            if not _project_relevant(memdir, marker, project):
+                continue
+            for f in sorted(memdir.glob("*.md")):
+                add(f, "claude-project-memory")
+
+    pp = _project_path(project)
+    if pp:
+        top_level_names = {
+            "AGENTS.md",
+            "CLAUDE.md",
+            "SESSION-BRIEFING.md",
+            "RADXA-SERVER-BRIEFING.md",
+            "RADXA-CAMERA-BRINGUP.md",
+            "CLAUDE-RADXA-BRANCH-AUDIT.md",
+            "Trellis-Engineering-Portfolio-Journal.md",
+        }
+        for name in top_level_names:
+            add(pp / name, "project-briefing")
+        temp = pp / "claude-temp"
+        if temp.exists():
+            keep = re.compile(r"(daily|memory|brief|report|recap|review|handoff)", re.I)
+            for f in sorted(temp.rglob("*.md")):
+                if keep.search(f.name) or keep.search(str(f.parent.relative_to(temp))):
+                    add(f, "project-daily-memory")
+
+    return out
+
+
+def _first_hit_line(text, query, tokens):
+    low_query = norm(query)
+    for i, line in enumerate(text.splitlines(), 1):
+        ln = norm(line)
+        if low_query and low_query in ln:
+            return i
+        if tokens and all(t in ln for t in tokens):
+            return i
+    for i, line in enumerate(text.splitlines(), 1):
+        ln = norm(line)
+        if any(t in ln for t in tokens):
+            return i
+    return 1
+
+
+def _memory_score(text, path, query):
+    hay = norm(str(path) + "\n" + text)
+    qn = norm(query)
+    tokens = [t for t in qn.split() if t]
+    if not tokens:
+        return 0, 0, 0, []
+    phrase_hits = hay.count(qn) if qn else 0
+    covered = [t for t in tokens if t in hay]
+    all_token_hits = 1 if len(covered) == len(tokens) else 0
+    score = phrase_hits * 1000 + all_token_hits * 100 + len(covered) * 10
+    return score, phrase_hits, all_token_hits, tokens
+
+
+def _memory_search_results(query, project=None):
+    results = []
+    for path, kind in durable_memory_files(project):
+        text = _read_text(path)
+        if not text:
+            continue
+        score, ph, at, tokens = _memory_score(text, path, query)
+        if score <= 0:
+            continue
+        line = _first_hit_line(text, query, tokens)
+        best = _snippet(text, query, tokens)
+        results.append((score, ph, at, path, kind, line, best))
+    results.sort(key=lambda r: (r[0], mtime(r[3])), reverse=True)
+    return results
+
+
+def _default_corpus_dir(project):
+    return _memory_root() / "graphify-corpus" / _slug(project or "all-memory", "all-memory")
+
+
+def _session_index_markdown(project=None, limit=80):
+    files = filter_files(session_files(), project)
+    files.sort(key=mtime, reverse=True)
+    lines = [
+        "# Session Index",
+        "",
+        "Generated for Graphify memory search. Raw transcripts are not copied here.",
+        "",
+    ]
+    for f in files[: max(0, limit)]:
+        m = scan(f)
+        first, last = branch_span(m)
+        lines += [
+            f"## {title_of(m)}",
+            "",
+            f"- session_id: `{m['session_id']}`",
+            f"- project: `{project_label(m, f)}`",
+            f"- git_branch: `{m['git'] or ''}`",
+            f"- activity: `{_fmt_time(first)}` to `{_fmt_time(last)}`",
+            f"- transcript_path: `{f}`",
+            "",
+        ]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _graphify_command():
+    exe = shutil.which("graphify")
+    if exe:
+        return [exe]
+    try:
+        probe = subprocess.run(
+            [sys.executable, "-c", "import graphify"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return None
+    if probe.returncode == 0:
+        return [sys.executable, "-m", "graphify"]
+    return None
+
+
+_STOPWORDS = {
+    "about", "after", "also", "before", "because", "been", "being", "between",
+    "could", "current", "during", "every", "files", "from", "have", "into",
+    "more", "need", "only", "other", "read", "repo", "same", "should", "source",
+    "that", "their", "there", "these", "this", "through", "using", "when",
+    "where", "which", "while", "with", "work", "would",
+}
+
+
+def _concept_id(label):
+    return "concept_" + _slug(label, "concept").replace("-", "_")
+
+
+def _source_id(i, path):
+    digest = hashlib.sha1(str(path).encode("utf-8", errors="replace")).hexdigest()[:10]
+    return f"source_{i:04d}_{digest}"
+
+
+def _extract_title(text, path):
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip()[:120] or Path(path).name
+    return Path(path).name
+
+
+def _line_for(text, needle):
+    n = needle.lower()
+    for i, line in enumerate(text.splitlines(), 1):
+        if n in line.lower():
+            return f"L{i}"
+    return "L1"
+
+
+def _concepts_from_text(text):
+    """Small deterministic memory graph extractor.
+
+    It favors durable routing concepts: headings, backticked names, branch-like
+    identifiers, paths, component-ish tokens, and frequent domain words. This is
+    deliberately conservative; raw transcript meaning still lives in show/search.
+    """
+    found = {}
+
+    def add(label, weight=1):
+        label = " ".join(str(label).strip().strip("`").split())
+        if not (3 <= len(label) <= 96):
+            return
+        low = label.lower()
+        if low in _STOPWORDS:
+            return
+        found[label] = found.get(label, 0) + weight
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            add(stripped.lstrip("#").strip(), 4)
+        for item in re.findall(r"`([^`]{3,120})`", line):
+            add(item, 5)
+
+    # Named branches, files, paths, hardware refs, and account/repo handles.
+    patterns = [
+        r"\b[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\b",
+        r"\b[A-Za-z][A-Za-z0-9_.-]*\.(?:md|py|json|toml|yaml|yml|kicad_[a-z]+|ino|sh|service)\b",
+        r"\b(?:Radxa-Server|internal-board|mac-dashboard|base-host|driver-bms-board-v1)\b",
+        r"\b(?:JonathanLiu01|JonathanLiu1401|Trellis|Radxa|PERIPH|BMS|KiCad|Graphify|Codex|Claude)\b",
+        r"\b[A-Z]{1,4}\d{1,3}\b",
+        r"\b\d{4}-\d{2}-\d{2}\b",
+    ]
+    for pat in patterns:
+        for item in re.findall(pat, text):
+            add(item, 4)
+
+    # Domain words that make natural-language queries land on useful source docs.
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", text):
+        low = token.lower()
+        if low in _STOPWORDS:
+            continue
+        if low in {
+            "branch", "branches", "roles", "runtime", "dashboard", "camera",
+            "memory", "recap", "deploy", "deployment", "service", "commit",
+            "push", "identity", "hardware", "schematic", "layout", "datasheet",
+            "journal", "report", "briefing", "router", "bridge", "control",
+            "worker", "diagnostics", "verification", "grounding", "board",
+        }:
+            add(low, 2)
+
+    ranked = sorted(found.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+    return [label for label, _ in ranked[:80]]
+
+
+def _build_memory_graph(project=None, corpus_dir=None):
+    corpus = Path(corpus_dir) if corpus_dir else _default_corpus_dir(project)
+    if not corpus.exists():
+        # Build the text corpus first so graph source paths are stable.
+        ns = argparse.Namespace(
+            project=project, out=str(corpus), max_files=None, session_limit=80,
+            run_graphify=False,
+        )
+        cmd_memory_corpus(ns)
+
+    sources = []
+    manifest = corpus / "manifest.json"
+    if manifest.exists():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            for rec in data.get("sources", []):
+                cp = rec.get("corpus_path")
+                if cp and Path(cp).is_file():
+                    sources.append((Path(cp), rec.get("kind") or "memory"))
+        except (OSError, ValueError):
+            sources = []
+    if not sources:
+        sources = [(p, "memory") for p in sorted(corpus.glob("source_*.md"))]
+
+    out_dir = corpus / "graphify-out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    nodes = []
+    links = []
+    concept_seen = {}
+
+    def ensure_concept(label, source_file, line):
+        cid = _concept_id(label)
+        if cid not in concept_seen:
+            concept_seen[cid] = True
+            nodes.append({
+                "id": cid,
+                "label": label,
+                "file_type": "concept",
+                "source_file": source_file,
+                "source_location": line,
+                "community": 1,
+            })
+        return cid
+
+    for i, (path, kind) in enumerate(sources, 1):
+        text = _read_text(path)
+        if not text:
+            continue
+        try:
+            rel = str(path.relative_to(corpus)).replace("\\", "/")
+        except ValueError:
+            rel = str(path)
+        sid = _source_id(i, path)
+        title = _extract_title(text, path)
+        nodes.append({
+            "id": sid,
+            "label": title,
+            "file_type": "document",
+            "source_file": rel,
+            "source_location": "L1",
+            "source_kind": kind,
+            "community": 0,
+        })
+        for label in _concepts_from_text(text):
+            line = _line_for(text, label)
+            cid = ensure_concept(label, rel, line)
+            links.append({
+                "source": sid,
+                "target": cid,
+                "_src": sid,
+                "_tgt": cid,
+                "relation": "references",
+                "confidence": "EXTRACTED",
+                "source_file": rel,
+                "source_location": line,
+                "weight": 1.0,
+            })
+
+    # Add co-occurrence edges between concepts from the same source. Cap per file
+    # keeps the graph useful without making every memory note a dense clique.
+    source_to_concepts = {}
+    for edge in links:
+        source_to_concepts.setdefault(edge["source"], []).append(edge["target"])
+    seen_edges = {(e["source"], e["target"]) for e in links}
+    for sid, cids in source_to_concepts.items():
+        limited = cids[:12]
+        for a_i, a in enumerate(limited):
+            for b in limited[a_i + 1:]:
+                key = tuple(sorted((a, b)))
+                if key in seen_edges:
+                    continue
+                seen_edges.add(key)
+                links.append({
+                    "source": key[0],
+                    "target": key[1],
+                    "_src": key[0],
+                    "_tgt": key[1],
+                    "relation": "conceptually_related_to",
+                    "confidence": "INFERRED",
+                    "source_file": "",
+                    "source_location": None,
+                    "weight": 0.3,
+                })
+
+    graph = {
+        "directed": False,
+        "multigraph": False,
+        "graph": {
+            "generated_by": "read-past-sessions memory-graph",
+            "project": project or "",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "nodes": nodes,
+        "links": links,
+    }
+    graph_path = out_dir / "graph.json"
+    graph_path.write_text(json.dumps(graph, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    report = [
+        "# Memory Graph Report",
+        "",
+        "Generated by `sessions.py memory-graph` from curated durable memory files.",
+        "Raw transcript JSONL files are not included.",
+        "",
+        f"- Project: `{project or ''}`",
+        f"- Nodes: {len(nodes)}",
+        f"- Edges: {len(links)}",
+        f"- Sources: {len(sources)}",
+        "",
+        "Use:",
+        "",
+        "```powershell",
+        f"python sessions.py memory-query \"your question\" --project {project or '<project>'}",
+        "```",
+        "",
+    ]
+    (out_dir / "GRAPH_REPORT.md").write_text("\n".join(report), encoding="utf-8")
+    (out_dir / ".graphify_python").write_text(sys.executable, encoding="utf-8")
+    return graph_path, len(nodes), len(links), len(sources)
+
+
+# --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 def _fmt_time(ts):
@@ -679,6 +1131,181 @@ def cmd_show(args):
             print(f"  shell commands run: {len(commands)}")
 
 
+def cmd_memory_search(args):
+    results = _memory_search_results(args.query, args.project)
+    if not results:
+        where = f" for project '{args.project}'" if args.project else ""
+        print(f"No durable memory files matched '{args.query}'{where}.")
+        print("Fall back to `search` for raw session transcript discovery.")
+        return
+    limit = max(1, args.limit)
+    shown_n = min(limit, len(results))
+    print(f"Memory search '{args.query}' -> {len(results)} file(s) matched, showing {shown_n}:\n")
+    for rank, (score, ph, at, path, kind, line, best) in enumerate(results[:limit], 1):
+        why = []
+        if ph:
+            why.append(f"{ph} exact-phrase hit(s)")
+        if at and not ph:
+            why.append("all keywords present")
+        print(f"{rank}. {path}")
+        print(f"    kind={kind}  line={line}  score={score}"
+              + (f"  ({', '.join(why)})" if why else ""))
+        if best:
+            print(f"    > {best}")
+        print()
+    print("If a hit is authoritative, read that file before opening raw transcripts.")
+
+
+def cmd_memory_corpus(args):
+    out_dir = Path(args.out) if args.out else _default_corpus_dir(args.project)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Remove only files generated by this command. Leave graphify-out/ alone so a
+    # previously built graph is not destroyed by refreshing the text corpus.
+    for old in out_dir.glob("source_*.md"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+    files = durable_memory_files(args.project)
+    if args.max_files:
+        files = files[: max(1, args.max_files)]
+
+    now = datetime.now(timezone.utc).isoformat()
+    index = _session_index_markdown(args.project, limit=args.session_limit)
+    session_index = out_dir / "source_0000_session-index.md"
+    session_index.write_text(index, encoding="utf-8")
+
+    manifest = {
+        "generated_at": now,
+        "project": args.project or "",
+        "corpus_dir": str(out_dir),
+        "sources": [
+            {"original_path": "<generated>", "corpus_path": str(session_index), "kind": "session-index"}
+        ],
+    }
+
+    for i, (src, kind) in enumerate(files, 1):
+        text = _read_text(src)
+        if not text:
+            continue
+        digest = hashlib.sha1(str(src).encode("utf-8", errors="replace")).hexdigest()[:10]
+        name = f"source_{i:04d}_{_slug(src.stem)}_{digest}.md"
+        dst = out_dir / name
+        header = "\n".join([
+            "---",
+            f"original_path: {json.dumps(str(src))}",
+            f"source_kind: {json.dumps(kind)}",
+            f"source_mtime: {json.dumps(_fmt_time(datetime.fromtimestamp(mtime(src), timezone.utc).isoformat()))}",
+            f"project_filter: {json.dumps(args.project or '')}",
+            "---",
+            "",
+            f"# Memory Source: {src.name}",
+            "",
+            f"Original path: `{src}`",
+            f"Source kind: `{kind}`",
+            "",
+        ])
+        dst.write_text(header + text.rstrip() + "\n", encoding="utf-8")
+        manifest["sources"].append(
+            {"original_path": str(src), "corpus_path": str(dst), "kind": kind}
+        )
+
+    (out_dir / "README.md").write_text(
+        "\n".join([
+            f"# Graphify Memory Corpus: {args.project or 'all memory'}",
+            "",
+            "This folder is generated by `sessions.py memory-corpus`.",
+            "It contains curated durable memories and a session index, not raw transcripts.",
+            "",
+            "Build or refresh a graph from here with Graphify, for example:",
+            "",
+            "```powershell",
+            f"graphify extract '{out_dir}' --out '{out_dir}' --force",
+            "```",
+            "",
+            "Then query it with:",
+            "",
+            "```powershell",
+            f"python sessions.py memory-query \"your question\" --project {args.project or '<project>'}",
+            "```",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    (out_dir / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    print(f"Wrote memory corpus: {out_dir}")
+    print(f"  sources: {len(manifest['sources'])} including generated session index")
+    print("  raw transcripts: excluded")
+
+    if args.run_graphify:
+        gcmd = _graphify_command()
+        if not gcmd:
+            print("Graphify CLI is not installed. Install `graphifyy` first, then rerun with --run-graphify.")
+            return
+        cmd = gcmd + ["extract", str(out_dir), "--out", str(out_dir), "--force"]
+        print("Running:", " ".join(cmd))
+        proc = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace")
+        if proc.returncode != 0:
+            print(f"Graphify exited with status {proc.returncode}.")
+
+
+def cmd_memory_graph(args):
+    graph_path, nodes, edges, sources = _build_memory_graph(args.project, args.corpus_dir)
+    print(f"Wrote memory graph: {graph_path}")
+    print(f"  sources: {sources}")
+    print(f"  nodes: {nodes}")
+    print(f"  edges: {edges}")
+    print("Query with:  python sessions.py memory-query \"your question\" --project "
+          + (args.project or "<project>"))
+
+
+def _graph_path_for(project, graph_dir=None):
+    if graph_dir:
+        p = Path(graph_dir)
+        if p.is_file():
+            return p
+        return p / "graphify-out" / "graph.json"
+    return _default_corpus_dir(project) / "graphify-out" / "graph.json"
+
+
+def cmd_memory_query(args):
+    graph_path = _graph_path_for(args.project, args.graph_dir)
+    gcmd = _graphify_command()
+    if graph_path.exists() and gcmd:
+        cmd = gcmd + ["query", args.query, "--graph", str(graph_path), "--budget", str(args.budget)]
+        if args.dfs:
+            cmd.append("--dfs")
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        sys.stdout.write(proc.stdout)
+        if proc.returncode != 0:
+            print(f"\nGraphify query failed with status {proc.returncode}; falling back to text memory search.\n")
+        else:
+            return
+    else:
+        if not graph_path.exists():
+            print(f"No memory graph found at {graph_path}.")
+            print("Run `memory-corpus` and build it with Graphify, or rely on the fallback below.\n")
+        elif not gcmd:
+            print("Graphify CLI is not installed; falling back to text memory search.\n")
+
+    fallback = argparse.Namespace(query=args.query, project=args.project, limit=args.limit)
+    cmd_memory_search(fallback)
+
+
 # --------------------------------------------------------------------------
 def build_parser():
     p = argparse.ArgumentParser(
@@ -707,6 +1334,45 @@ def build_parser():
     ph.add_argument("--include-subagents", action="store_true")
     ph.add_argument("--max-chars", type=int, default=60000)
     ph.set_defaults(func=cmd_show)
+
+    pm = sub.add_parser("memory-search", help="search durable memory files before raw transcripts")
+    pm.add_argument("query")
+    pm.add_argument("--project", default=None,
+                    help="optional project filter such as Trellis")
+    pm.add_argument("--limit", type=int, default=10)
+    pm.set_defaults(func=cmd_memory_search)
+
+    pc = sub.add_parser("memory-corpus", help="build a Graphify-ready durable-memory corpus")
+    pc.add_argument("project", nargs="?", default=None,
+                    help="optional project filter such as Trellis")
+    pc.add_argument("--out", default=None,
+                    help="output directory; default is ~/.codex/memories/graphify-corpus/<project>")
+    pc.add_argument("--max-files", type=int, default=None,
+                    help="cap copied memory source files")
+    pc.add_argument("--session-limit", type=int, default=80,
+                    help="number of session metadata entries to include")
+    pc.add_argument("--run-graphify", action="store_true",
+                    help="after writing the corpus, run `graphify extract` if the CLI is installed")
+    pc.set_defaults(func=cmd_memory_corpus)
+
+    pg = sub.add_parser("memory-graph", help="build a local Graphify-compatible durable-memory graph")
+    pg.add_argument("project", nargs="?", default=None,
+                    help="optional project filter such as Trellis")
+    pg.add_argument("--corpus-dir", default=None,
+                    help="existing corpus directory; default is ~/.codex/memories/graphify-corpus/<project>")
+    pg.set_defaults(func=cmd_memory_graph)
+
+    pq = sub.add_parser("memory-query", help="query an existing Graphify memory graph, fallback to memory-search")
+    pq.add_argument("query")
+    pq.add_argument("--project", default=None,
+                    help="optional project filter such as Trellis")
+    pq.add_argument("--graph-dir", default=None,
+                    help="directory containing graphify-out/graph.json, or graph.json itself")
+    pq.add_argument("--budget", type=int, default=2500)
+    pq.add_argument("--dfs", action="store_true")
+    pq.add_argument("--limit", type=int, default=10,
+                    help="fallback memory-search limit")
+    pq.set_defaults(func=cmd_memory_query)
     return p
 
 
