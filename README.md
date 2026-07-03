@@ -16,7 +16,7 @@ agent sessions without rereading raw transcript JSONL files.
 | File | Purpose |
 |---|---|
 | `SKILL.md` | The skill definition loaded by Claude Code. |
-| `scripts/sessions.py` | The engine. Pure Python, no third-party dependencies for transcript and deterministic memory-graph operations. |
+| `scripts/sessions.py` | The engine. Pure Python, no third-party dependencies for transcript and deterministic memory-graph operations. Uses Codex CLI when asked to synthesize a semantic memory digest. |
 
 ## The engine
 
@@ -34,7 +34,8 @@ python scripts/sessions.py <command> ...
 | `search QUERY [--project P] [--limit N]` | Find sessions by content: prose, tool calls, file paths, commands, and tool output. |
 | `show SESSION [--mode briefing\|full\|prompts] [--all-branches] [--include-subagents] [--max-chars N]` | Condensed transcript of one session. `SESSION` is a session id, a partial id, or a file path. |
 | `memory-search QUERY [--project P] [--limit N]` | Search curated durable memory files before raw transcripts. |
-| `memory-corpus [PROJECT] [--out DIR] [--session-limit N]` | Build a Graphify-ready corpus from durable memory summaries plus a session index. |
+| `memory-corpus [PROJECT] [--out DIR] [--session-limit N] [--run-codex]` | Build a Graphify-ready corpus from durable memory summaries plus a session index. |
+| `memory-codex [PROJECT] [--build-graph]` | Use Codex CLI, not an API key, to add a semantic digest source to the memory corpus. |
 | `memory-graph [PROJECT] [--corpus-dir DIR]` | Build a deterministic Graphify-compatible `graphify-out/graph.json` without requiring an LLM API key. |
 | `memory-query QUERY [--project P] [--graph-dir DIR] [--budget N] [--dfs]` | Query the memory graph with Graphify when available; otherwise fall back to text memory search. |
 
@@ -43,6 +44,10 @@ Transcripts are read from `$CLAUDE_CONFIG_DIR/projects/` or `~/.claude/projects/
 Durable memory is read from the local Codex/Claude memory locations and selected
 project briefing files. `memory-corpus` and `memory-graph` deliberately exclude
 raw transcript `.jsonl` files.
+
+When Codex CLI is authenticated, prefer `memory-codex <project> --build-graph`
+over API-backed Graphify extraction. It runs `codex exec` locally through the CLI
+and stores the result as `codex-cli-memory.md` inside the corpus.
 
 ## Installation
 

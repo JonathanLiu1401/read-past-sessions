@@ -53,7 +53,8 @@ Durable-memory commands:
 | Command | Purpose |
 |---|---|
 | `memory-search QUERY [--project P] [--limit N]` | Search curated durable memory before raw transcripts: Codex memory registry/rollout summaries, Claude project memory files, and project briefing/daily-memory files. Use this first for branch roles, current project state, daily recaps, or "what should future agents remember?" |
-| `memory-corpus [PROJECT] [--out DIR] [--session-limit N] [--run-graphify]` | Write a Graphify-ready text corpus containing durable memories plus a generated session index. Raw JSONL transcripts are deliberately excluded. Default output is `~/.codex/memories/graphify-corpus/<project>/`. |
+| `memory-corpus [PROJECT] [--out DIR] [--session-limit N] [--run-codex] [--run-graphify]` | Write a Graphify-ready text corpus containing durable memories plus a generated session index. Raw JSONL transcripts are deliberately excluded. Default output is `~/.codex/memories/graphify-corpus/<project>/`. |
+| `memory-codex [PROJECT] [--build-graph]` | Use the local Codex CLI, not an API key, to add `codex-cli-memory.md` as a semantic digest source in the corpus. This is the preferred semantic pass when Codex CLI is authenticated. |
 | `memory-graph [PROJECT] [--corpus-dir DIR]` | Build a local Graphify-compatible `graphify-out/graph.json` from the curated memory corpus without API keys. This deterministic fallback is useful when `graphify extract` cannot semantically process Markdown because no LLM backend is configured. |
 | `memory-query QUERY [--project P] [--graph-dir DIR] [--budget N] [--dfs]` | Query an existing Graphify memory graph if `graphify-out/graph.json` and the Graphify CLI are present. Falls back to `memory-search` when no graph is available. |
 
@@ -78,6 +79,17 @@ corpus with:
 
 ```
 memory-corpus Trellis
+memory-codex Trellis --build-graph
+```
+
+Use `memory-codex` in place of API-backed extraction whenever Codex CLI is
+authenticated on the machine. It calls `codex exec` in read-only ephemeral mode,
+stores a compact semantic digest in the memory corpus, and rebuilds the graph if
+`--build-graph` is set.
+
+If Codex CLI is not available, use the deterministic graph builder:
+
+```
 memory-graph Trellis
 ```
 
@@ -87,9 +99,10 @@ Then query it through Graphify if the CLI is installed:
 memory-query "Radxa branch roles" --project Trellis
 ```
 
-Use `graphify extract ...` only when an LLM backend/API key is available for
-Markdown semantic extraction. Without that backend, use `memory-graph` so the
-query surface still exists and stays deterministic.
+Use `graphify extract ...` only when you explicitly want Graphify's API-backed
+semantic extraction and an LLM backend/API key is available. Otherwise prefer
+`memory-codex Trellis --build-graph`; if Codex CLI is unavailable, use
+`memory-graph` so the query surface still exists and stays deterministic.
 
 Do not graphify raw transcript `.jsonl` files by default; graph the curated
 durable-memory corpus instead. Raw transcripts are still available through
