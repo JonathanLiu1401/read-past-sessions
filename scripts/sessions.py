@@ -2,13 +2,18 @@
 """
 read-past-sessions engine
 ==========================
-Find and read past Claude Code session transcripts so a new chat can be
-"forked" off a previous one.
+Find and read past Claude Code and Cursor agent session transcripts so a new
+chat can be "forked" off a previous one.
 
 Claude Code stores every session as a JSONL file at:
     <config>/projects/<path-encoded-cwd>/<session-uuid>.jsonl
 where <config> is $CLAUDE_CONFIG_DIR or ~/.claude. Each line is one JSON
 object with a "type" (user / assistant / system / ai-title / last-prompt / ...).
+
+Cursor IDE/cursor-agent stores transcripts as:
+    ~/.cursor/projects/<path-encoded-cwd>/agent-transcripts/<session-id>/<session-id>.jsonl
+Those lines are simpler {"role": ..., "message": {"content": [...]}} objects,
+so the scanner synthesizes a linear branch in file order.
 
 Why this script exists instead of just reading the files:
   * Files get huge (tens of MB) -- reading them raw blows the context window.
@@ -60,7 +65,18 @@ def base_dir():
     return root / "projects"
 
 
-def session_files():
+def cursor_base_dir():
+    cfg = os.environ.get("CURSOR_CONFIG_DIR")
+    root = Path(cfg) if cfg else (Path.home() / ".cursor")
+    return root / "projects"
+
+
+def is_cursor_transcript(path):
+    parts = [p.lower() for p in Path(path).parts]
+    return "agent-transcripts" in parts and Path(path).suffix.lower() == ".jsonl"
+
+
+def claude_session_files():
     """All top-level *.jsonl session files. project.glob('*.jsonl') matches
     only direct children, so subfolders like memory/ are skipped."""
     base = base_dir()
@@ -71,6 +87,32 @@ def session_files():
         if proj.is_dir():
             out.extend(proj.glob("*.jsonl"))
     return out
+
+
+def cursor_session_files():
+    """Cursor IDE/cursor-agent transcripts stored as
+    <cursor>/projects/<project>/agent-transcripts/<session-id>/<session-id>.jsonl."""
+    base = cursor_base_dir()
+    out = []
+    if not base.exists():
+        return out
+    for proj in base.iterdir():
+        if not proj.is_dir():
+            continue
+        transcripts = proj / "agent-transcripts"
+        if not transcripts.exists():
+            continue
+        out.extend(transcripts.glob("*/*.jsonl"))
+        out.extend(transcripts.glob("*.jsonl"))
+    return out
+
+
+def session_files(source="claude"):
+    if source == "cursor":
+        return cursor_session_files()
+    if source == "all":
+        return claude_session_files() + cursor_session_files()
+    return claude_session_files()
 
 
 def mtime(path):
@@ -128,9 +170,9 @@ def format_tool(block):
                 return str(v)
         return ""
 
-    if name in ("Edit", "Write", "Read", "NotebookEdit", "MultiEdit"):
+    if name in ("Edit", "Write", "Read", "NotebookEdit", "MultiEdit", "StrReplace"):
         arg = g("file_path", "notebook_path", "path")
-    elif name == "Bash":
+    elif name in ("Bash", "Shell"):
         arg = g("command")
     elif name in ("Grep", "Glob"):
         arg = g("pattern")
@@ -233,13 +275,94 @@ def is_real_prompt(text):
     return not t.startswith(SYSTEM_PREFIXES)
 
 
+_USER_QUERY_RE = re.compile(r"\A\s*(?:<timestamp>.*?</timestamp>\s*)?<user_query>(.*)</user_query>\s*\Z", re.S)
+_TIMESTAMP_RE = re.compile(r"\A\s*<timestamp>.*?</timestamp>\s*", re.S)
+
+
+def clean_prompt_text(text):
+    """Unwrap Cursor-style <timestamp>/<user_query> wrappers for display while
+    leaving the underlying prompt text intact."""
+    t = (text or "").strip()
+    m = _USER_QUERY_RE.match(t)
+    if m:
+        return m.group(1).strip()
+    return _TIMESTAMP_RE.sub("", t).strip()
+
+
 # --------------------------------------------------------------------------
 # Session scan
 # --------------------------------------------------------------------------
+def scan_cursor(path, full=False):
+    """Scan a Cursor agent-transcripts JSONL file.
+
+    Cursor lines are simple {"role": ..., "message": {"content": [...]}} objects
+    with no uuid/parentUuid/timestamp, so synthesize a linear branch in file
+    order and use file mtime for recency."""
+    parent = {}
+    kind = {}
+    ts_map = {}
+    entries = {} if full else None
+    leaf = None
+    ai_titles = []
+    custom_title = None
+    cwd = git = version = None
+    ts_first = ts_last = None
+    nuser = nasst = nside = 0
+    first_prompt = None
+    prev = None
+    idx = 0
+
+    for o in iter_lines(path):
+        role = o.get("role") or o.get("type")
+        if role not in ("user", "assistant"):
+            continue
+        idx += 1
+        u = f"cursor-{idx}"
+        parent[u] = prev
+        kind[u] = role
+        if full:
+            entries[u] = {
+                "type": role,
+                "uuid": u,
+                "parentUuid": prev,
+                "message": o.get("message"),
+                "timestamp": o.get("timestamp"),
+                "isSidechain": False,
+            }
+        ts = o.get("timestamp") or o.get("createdAt") or o.get("updatedAt")
+        if ts:
+            ts_first = ts_first or ts
+            ts_last = ts
+            ts_map[u] = ts
+        if role == "user":
+            nuser += 1
+            if first_prompt is None:
+                msg = o.get("message")
+                txt, _ = extract(msg.get("content") if isinstance(msg, dict) else None)
+                txt = clean_prompt_text(txt)
+                if is_real_prompt(txt):
+                    first_prompt = txt.strip()
+        else:
+            nasst += 1
+        prev = u
+        leaf = u
+
+    return dict(
+        path=str(path), parent=parent, kind=kind, ts_map=ts_map,
+        entries=entries, leaf=leaf,
+        ai_titles=ai_titles, custom_title=custom_title, cwd=cwd, git=git,
+        version=version, ts_first=ts_first, ts_last=ts_last,
+        nuser=nuser, nasst=nasst, nside=nside, first_prompt=first_prompt,
+        session_id=Path(path).stem, mtime=mtime(path), source="cursor",
+    )
+
+
 def scan(path, full=False):
     """One pass over a session file.
     Always collects metadata + parent/type maps (cheap, for live-branch size).
     With full=True also keeps the entries themselves (for rendering)."""
+    if is_cursor_transcript(path):
+        return scan_cursor(path, full=full)
     parent = {}        # uuid -> parentUuid
     kind = {}          # uuid -> 'user'/'assistant'/...
     ts_map = {}        # uuid -> timestamp (user/assistant only)
@@ -287,6 +410,7 @@ def scan(path, full=False):
                 if first_prompt is None:
                     msg = o.get("message")
                     txt, _ = extract(msg.get("content") if isinstance(msg, dict) else None)
+                    txt = clean_prompt_text(txt)
                     if is_real_prompt(txt):
                         first_prompt = txt.strip()
             else:
@@ -353,8 +477,17 @@ def title_of(meta):
 
 def project_label(meta, path):
     """Prefer the real cwd recorded inside the session; fall back to the
-    path-encoded folder name."""
-    return meta.get("cwd") or Path(path).parent.name
+    path-encoded folder name. Cursor transcripts live two levels below the
+    project folder (<project>/agent-transcripts/<id>/<id>.jsonl)."""
+    if meta.get("cwd"):
+        return meta["cwd"]
+    p = Path(path)
+    if is_cursor_transcript(p):
+        try:
+            return p.parents[2].name
+        except IndexError:
+            pass
+    return p.parent.name
 
 
 # --------------------------------------------------------------------------
@@ -366,8 +499,14 @@ def match_project(path, query):
     if not query:
         return True
     qn = norm(query)
-    folder = path.parent.name
-    return qn in norm(folder)
+    p = Path(path)
+    folders = [p.parent.name]
+    if is_cursor_transcript(p):
+        try:
+            folders.append(p.parents[2].name)
+        except IndexError:
+            pass
+    return any(qn in norm(folder) for folder in folders)
 
 
 def filter_files(files, project):
@@ -544,7 +683,7 @@ def _default_corpus_dir(project):
 
 
 def _session_index_markdown(project=None, limit=80):
-    files = filter_files(session_files(), project)
+    files = filter_files(session_files("all"), project)
     files.sort(key=mtime, reverse=True)
     lines = [
         "# Session Index",
@@ -1049,7 +1188,7 @@ def _fmt_time(ts):
 
 
 def cmd_list(args):
-    files = filter_files(session_files(), args.project)
+    files = filter_files(session_files(getattr(args, "source", "claude")), args.project)
     files.sort(key=mtime, reverse=True)
     shown = files[: max(1, args.limit)]
     if not shown:
@@ -1095,7 +1234,7 @@ def _snippet(text, query, tokens, width=200):
 
 
 def cmd_search(args):
-    files = filter_files(session_files(), args.project)
+    files = filter_files(session_files(getattr(args, "source", "claude")), args.project)
     files.sort(key=mtime, reverse=True)
     qn = norm(args.query)
     tokens = [t for t in qn.split() if t]
@@ -1111,7 +1250,8 @@ def cmd_search(args):
         best_text = None
         m = None
         for o in iter_lines(f):
-            if o.get("type") not in ("user", "assistant"):
+            role = o.get("type") or o.get("role")
+            if role not in ("user", "assistant"):
                 continue
             raw = searchable(o)
             if not raw:
@@ -1165,7 +1305,7 @@ def cmd_search(args):
     print("Read one with:  python sessions.py show <id>")
 
 
-def _resolve(session):
+def _resolve(session, source="claude"):
     """Return the list of files matching a session id / partial id / path.
     A full path resolves uniquely; an id may legitimately match more than one
     file (the same uuid can exist in two projects, and partial ids collide), so
@@ -1174,9 +1314,10 @@ def _resolve(session):
     p = Path(session)
     if p.exists() and p.is_file():
         return [p]
-    cands = [f for f in session_files() if f.stem == session]
+    files = session_files(source)
+    cands = [f for f in files if f.stem == session]
     if not cands:
-        cands = [f for f in session_files() if session.lower() in f.stem.lower()]
+        cands = [f for f in files if session.lower() in f.stem.lower()]
     cands.sort(key=mtime, reverse=True)
     return cands
 
@@ -1228,7 +1369,7 @@ def _fit(blocks, budget):
 
 
 def cmd_show(args):
-    cands = _resolve(args.session)
+    cands = _resolve(args.session, getattr(args, "source", "claude"))
     if not cands:
         print(f"No session matching '{args.session}'. Use `list` or `search` to find an id.")
         return
@@ -1309,6 +1450,7 @@ def cmd_show(args):
                 commands.append(a.split(":", 1)[1].strip())
 
         if role == "user":
+            text = clean_prompt_text(text)
             if o.get("isCompactSummary"):
                 blocks.append("### [COMPACTION SUMMARY]\n" + _trunc(text, 4000) + "\n\n")
             elif is_real_prompt(text):  # skip tool_result echoes / system reminders
@@ -1574,10 +1716,82 @@ def cmd_memory_query(args):
 
 
 # --------------------------------------------------------------------------
+def grok_engine_path():
+    """Path to the Grok Build sessions engine, if installed."""
+    candidates = [
+        Path.home() / ".grok" / "skills" / "read-past-sessions" / "scripts" / "sessions.py",
+        Path(os.environ.get("GROK_HOME", "")).expanduser() / "skills" / "read-past-sessions" / "scripts" / "sessions.py"
+        if os.environ.get("GROK_HOME") else None,
+    ]
+    for p in candidates:
+        if p is not None and p.is_file():
+            return p
+    return None
+
+
+def run_grok_engine(argv):
+    """Delegate list/search/show/memory-search to the Grok engine."""
+    eng = grok_engine_path()
+    if not eng:
+        print(
+            "Grok engine not found. Expected "
+            "~/.grok/skills/read-past-sessions/scripts/sessions.py",
+            file=sys.stderr,
+        )
+        return 2
+    # Force grok source so the Grok engine does not bounce back here.
+    cmd = [sys.executable, str(eng), "--source", "grok"] + list(argv)
+    try:
+        proc = subprocess.run(cmd, check=False)
+    except OSError as e:
+        print(f"Failed to run Grok engine: {e}", file=sys.stderr)
+        return 2
+    return int(proc.returncode)
+
+
+def _forward_argv_for_cmd(args):
+    """Rebuild a minimal argv list for the Grok engine from parsed args."""
+    cmd = args.cmd
+    if cmd == "list":
+        out = ["list"]
+        if getattr(args, "project", None):
+            out.append(args.project)
+        out += ["--limit", str(getattr(args, "limit", 15))]
+        return out
+    if cmd == "search":
+        out = ["search", args.query]
+        if getattr(args, "project", None):
+            out += ["--project", args.project]
+        out += ["--limit", str(getattr(args, "limit", 10))]
+        return out
+    if cmd == "show":
+        out = ["show", args.session, "--mode", getattr(args, "mode", "briefing")]
+        out += ["--max-chars", str(getattr(args, "max_chars", 24000))]
+        if getattr(args, "project", None):
+            out += ["--project", args.project]
+        return out
+    if cmd == "memory-search":
+        out = ["memory-search", args.query]
+        if getattr(args, "project", None):
+            out += ["--project", args.project]
+        out += ["--limit", str(getattr(args, "limit", 10))]
+        return out
+    return [cmd]
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="sessions.py",
-        description="Find and read past Claude Code session transcripts.")
+        description="Find and read past Claude Code, Cursor agent, and optionally Grok session transcripts.")
+    p.add_argument(
+        "--source",
+        choices=("claude", "grok", "cursor", "all"),
+        default="claude",
+        help="Which session store to use (default: claude). "
+             "cursor reads ~/.cursor/projects/*/agent-transcripts; "
+             "grok delegates to ~/.grok/skills/read-past-sessions; "
+             "all runs Claude then Cursor then Grok for list/search.",
+    )
     sub = p.add_subparsers(dest="cmd")
 
     pl = sub.add_parser("list", help="recent sessions, newest first")
@@ -1675,6 +1889,46 @@ def main(argv):
     args = parser.parse_args(argv)
     if not getattr(args, "cmd", None):
         parser.print_help()
+        return
+
+    source = getattr(args, "source", "claude") or "claude"
+    # Only list/search/show/memory-search cross-delegate; graph/corpus stay local.
+    delegable = {"list", "search", "show", "memory-search"}
+    if source == "grok" and args.cmd in delegable:
+        raise SystemExit(run_grok_engine(_forward_argv_for_cmd(args)))
+    if source == "all" and args.cmd in delegable:
+        if args.cmd == "show":
+            if _resolve(args.session, "all"):
+                args.source = "all"
+                args.func(args)
+                return
+            print("=== GROK ===", flush=True)
+            code = run_grok_engine(_forward_argv_for_cmd(args))
+            if code not in (0, None):
+                raise SystemExit(code)
+            return
+        if args.cmd in ("list", "search"):
+            print("=== CLAUDE ===", flush=True)
+            args.source = "claude"
+            args.func(args)
+            sys.stdout.flush()
+            print("=== CURSOR ===", flush=True)
+            args.source = "cursor"
+            args.func(args)
+            sys.stdout.flush()
+            print("=== GROK ===", flush=True)
+            code = run_grok_engine(_forward_argv_for_cmd(args))
+            if code not in (0, None):
+                raise SystemExit(code)
+            return
+        print("=== CLAUDE ===", flush=True)
+        args.source = "claude"
+        args.func(args)
+        sys.stdout.flush()
+        print("=== GROK ===", flush=True)
+        code = run_grok_engine(_forward_argv_for_cmd(args))
+        if code not in (0, None):
+            raise SystemExit(code)
         return
     args.func(args)
 
