@@ -1,7 +1,9 @@
 # read-past-sessions
 
-A Claude Code skill for finding and reading past Claude Code session transcripts
-and turning them into concise context briefings for the current chat.
+A cross-agent skill for finding and reading past session transcripts across
+**Claude Code**, **Grok**, **Cursor IDE / cursor-agent CLI**, **Antigravity (agy)**,
+**clx**, and **clg**, turning them into concise context briefings for the
+current chat.
 
 Use it when you want to fork off, continue, resume, or pick up from a previous
 session; recall what was decided in an earlier chat; or find which old session
@@ -11,50 +13,71 @@ It can also search curated durable memory files and build a local
 Graphify-compatible memory graph, so project knowledge can be shared between
 agent sessions without rereading raw transcript JSONL files.
 
-## What's here
+## Supported session stores
 
-| File | Purpose |
-|---|---|
-| `SKILL.md` | The skill definition loaded by Claude Code. |
-| `scripts/sessions.py` | The engine. Pure Python, no third-party dependencies for transcript and deterministic memory-graph operations. Uses Codex CLI when asked to synthesize a semantic memory digest. |
+| Store | Flag | Location | Description |
+|---|---|---|---|
+| **Claude Code** | `--source claude` | `~/.claude/projects/<cwd>/*.jsonl` | Direct Claude Code sessions |
+| **CLX** | `--source clx` | `~/.claude-clx/projects/<cwd>/*.jsonl` | Claude Code on Grok via CLIProxyAPI |
+| **CLG** | `--source clg` | `~/.claude-clg/projects/<cwd>/*.jsonl` | Claude Code on Gemini via CLIProxyAPI |
+| **Cursor** | `--source cursor` or `--source cursor-agent` | `~/.cursor/projects/<cwd>/agent-transcripts/*/*.jsonl` | Cursor IDE and cursor-agent CLI |
+| **Grok Build** | `--source grok` | `~/.grok/sessions/<url-encoded-cwd>/<id>/` | Grok Build CLI / TUI |
+| **Antigravity** | `--source agy` or `--source antigravity` | `~/.gemini/antigravity-cli/brain/<id>/...` | Antigravity CLI transcripts |
+| **All Stores** | `--source all` | All 6 engines above | Chronologically merged and ranked |
+
+Default source: auto-detected from current Claude profile (`clx` in `CLAUDE_CONFIG_DIR=~/.claude-clx`, `clg` in `CLAUDE_CONFIG_DIR=~/.claude-clg`, otherwise `claude`).
 
 ## The engine
 
-`scripts/sessions.py` does the heavy lifting so Claude never has to read raw
-`.jsonl` transcripts directly. Those files can be tens of MB and are conversation
-trees, mixing the live thread with abandoned or rewound branches.
+`scripts/sessions.py` does the heavy lifting so agents never have to read raw
+transcripts directly. Those files can be tens of MB and contain abandoned turns,
+system prompts, and large tool outputs.
 
 ```powershell
-python scripts/sessions.py <command> ...
+python scripts/sessions.py [--source claude|clx|clg|cursor|grok|agy|all] <command> ...
 ```
 
 | Command | Purpose |
 |---|---|
-| `list [PROJECT] [--limit N]` | Recent sessions, newest first. `PROJECT` is an optional case- and separator-insensitive substring of the working directory. |
-| `search QUERY [--project P] [--limit N]` | Find sessions by content: prose, tool calls, file paths, commands, and tool output. |
-| `show SESSION [--mode briefing\|full\|prompts] [--all-branches] [--include-subagents] [--max-chars N]` | Condensed transcript of one session. `SESSION` is a session id, a partial id, or a file path. |
+| `list [PROJECT] [--limit N] [--source S]` | Recent sessions, newest first. `PROJECT` is an optional case- and separator-insensitive substring of the working directory. |
+| `search QUERY [--project P] [--limit N] [--source S]` | Find sessions by content: prose, tool calls, file paths, commands, and tool output. |
+| `show SESSION [--mode briefing\|full\|prompts] [--all-branches] [--include-subagents] [--max-chars N] [--source S]` | Condensed transcript of one session. `SESSION` is a session id, a partial id, or a file path. If not in the active source, auto-resolves across all stores. |
 | `memory-search QUERY [--project P] [--limit N]` | Search curated durable memory files before raw transcripts. |
 | `memory-corpus [PROJECT] [--out DIR] [--session-limit N] [--run-codex]` | Build a Graphify-ready corpus from durable memory summaries plus a session index. |
-| `memory-codex [PROJECT] [--build-graph]` | Use Codex CLI, not an API key, to add a semantic digest source to the memory corpus. |
+| `memory-codex [PROJECT] [--build-graph]` | Use Codex CLI to add a semantic digest source to the memory corpus. |
 | `memory-graph [PROJECT] [--corpus-dir DIR]` | Build a deterministic Graphify-compatible `graphify-out/graph.json` without requiring an LLM API key. |
 | `memory-query QUERY [--project P] [--graph-dir DIR] [--budget N] [--dfs]` | Query the memory graph with Graphify when available; otherwise fall back to text memory search. |
 
-Transcripts are read from `$CLAUDE_CONFIG_DIR/projects/` or `~/.claude/projects/`.
+## Quick examples
 
-Durable memory is read from the local Codex/Claude memory locations and selected
-project briefing files. `memory-corpus` and `memory-graph` deliberately exclude
-raw transcript `.jsonl` files.
+```powershell
+# List recent sessions across all 6 stores
+python scripts/sessions.py --source all list Trellis --limit 10
 
-When Codex CLI is authenticated, prefer `memory-codex <project> --build-graph`
-over API-backed Graphify extraction. It runs `codex exec` locally through the CLI
-and stores the result as `codex-cli-memory.md` inside the corpus.
+# Search for a topic across all platforms
+python scripts/sessions.py --source all search "bq76922 balancing"
+
+# Show a specific session (auto-resolves across stores)
+python scripts/sessions.py show 019fb75c
+
+# Filter to a specific agent harness
+python scripts/sessions.py --source grok list --limit 5
+python scripts/sessions.py --source agy search "Antigravity"
+python scripts/sessions.py --source clx list --limit 5
+python scripts/sessions.py --source clg list --limit 5
+python scripts/sessions.py --source cursor list --limit 5
+```
 
 ## Installation
 
-Copy this directory into your Claude Code skills folder:
+Copy this directory into your Claude Code or Agents skills folder:
 
 ```text
 ~/.claude/skills/read-past-sessions/
 ```
 
-Claude Code will pick it up automatically.
+or for shared cross-agent discovery:
+
+```text
+~/.agents/skills/read-past-sessions/
+```
