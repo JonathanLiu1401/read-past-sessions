@@ -2,7 +2,7 @@
 
 A cross-agent skill for finding and reading past session transcripts across
 **Claude Code**, **Grok**, **Cursor IDE / cursor-agent CLI**, **Antigravity (agy)**,
-**clx**, and **clg**, turning them into concise context briefings for the
+**clx**, **clg**, **clc**, and **cld**, turning them into concise context briefings for the
 current chat.
 
 Use it when you want to fork off, continue, resume, or pick up from a previous
@@ -20,12 +20,14 @@ agent sessions without rereading raw transcript JSONL files.
 | **Claude Code** | `--source claude` | `~/.claude/projects/<cwd>/*.jsonl` | Direct Claude Code sessions |
 | **CLX** | `--source clx` | `~/.claude-clx/projects/<cwd>/*.jsonl` | Claude Code on Grok via CLIProxyAPI |
 | **CLG** | `--source clg` | `~/.claude-clg/projects/<cwd>/*.jsonl` | Claude Code on Gemini via CLIProxyAPI |
+| **CLC** | `--source clc` | `~/.claude-clc/projects/<cwd>/*.jsonl` | Claude Code on Cursor via local translator |
+| **CLD** | `--source cld` | `~/.claude-cld/projects/<cwd>/*.jsonl` | Claude Code on DeepSeek |
 | **Cursor** | `--source cursor` or `--source cursor-agent` | `~/.cursor/projects/<cwd>/agent-transcripts/*/*.jsonl` | Cursor IDE and cursor-agent CLI |
 | **Grok Build** | `--source grok` | `~/.grok/sessions/<url-encoded-cwd>/<id>/` | Grok Build CLI / TUI |
 | **Antigravity** | `--source agy` or `--source antigravity` | `~/.gemini/antigravity-cli/brain/<id>/...` | Antigravity CLI transcripts |
-| **All Stores** | `--source all` | All 6 engines above | Chronologically merged and ranked |
+| **All Stores** | `--source all` | All engines above | Chronologically merged and ranked |
 
-Default source: auto-detected from current Claude profile (`clx` in `CLAUDE_CONFIG_DIR=~/.claude-clx`, `clg` in `CLAUDE_CONFIG_DIR=~/.claude-clg`, otherwise `claude`).
+Default source: auto-detected from current Claude profile (`clx` / `clg` / `clc` / `cld` via `CLAUDE_CONFIG_DIR`, otherwise `claude`).
 
 ## The engine
 
@@ -34,7 +36,7 @@ transcripts directly. Those files can be tens of MB and contain abandoned turns,
 system prompts, and large tool outputs.
 
 ```powershell
-python scripts/sessions.py [--source claude|clx|clg|cursor|grok|agy|all] <command> ...
+python scripts/sessions.py [--source claude|clx|clg|clc|cld|cursor|grok|agy|all] <command> ...
 ```
 
 | Command | Purpose |

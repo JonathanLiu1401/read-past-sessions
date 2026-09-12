@@ -9,6 +9,8 @@ Session stores supported:
   * claude: Claude Code sessions at ~/.claude/projects/<path-encoded-cwd>/*.jsonl
   * clx: Claude Code (grok via CLIProxyAPI) at ~/.claude-clx/projects/<cwd>/*.jsonl
   * clg: Claude Code (Gemini via CLIProxyAPI) at ~/.claude-clg/projects/<cwd>/*.jsonl
+  * clc: Claude Code (Cursor translator) at ~/.claude-clc/projects/<cwd>/*.jsonl
+  * cld: Claude Code (DeepSeek) at ~/.claude-cld/projects/<cwd>/*.jsonl
   * cursor / cursor-agent: Cursor sessions at ~/.cursor/projects/<cwd>/agent-transcripts/*/*.jsonl
   * grok: Grok Build sessions at ~/.grok/sessions/<url-encoded-cwd>/<id>/
   * agy / antigravity: Antigravity CLI at ~/.gemini/antigravity-cli/brain/<id>/...
@@ -63,6 +65,10 @@ def default_source():
         return "clx"
     if cfg.endswith("-clg"):
         return "clg"
+    if cfg.endswith("-clc"):
+        return "clc"
+    if cfg.endswith("-cld"):
+        return "cld"
     return "claude"
 
 
@@ -79,7 +85,7 @@ def normalize_source(src):
 
 def claude_base_dir():
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
-    if cfg and not (cfg.endswith("-clx") or cfg.endswith("-clg")):
+    if cfg and not any(cfg.endswith(s) for s in ("-clx", "-clg", "-clc", "-cld")):
         root = Path(cfg)
     else:
         root = Path.home() / ".claude"
@@ -95,6 +101,18 @@ def clx_base_dir():
 def clg_base_dir():
     cfg = os.environ.get("CLG_CONFIG_DIR")
     root = Path(cfg) if cfg else (Path.home() / ".claude-clg")
+    return root / "projects"
+
+
+def clc_base_dir():
+    cfg = os.environ.get("CLC_CONFIG_DIR")
+    root = Path(cfg) if cfg else (Path.home() / ".claude-clc")
+    return root / "projects"
+
+
+def cld_base_dir():
+    cfg = os.environ.get("CLD_CONFIG_DIR")
+    root = Path(cfg) if cfg else (Path.home() / ".claude-cld")
     return root / "projects"
 
 
@@ -140,6 +158,16 @@ def clx_session_files():
 def clg_session_files():
     """All top-level *.jsonl session files in CLG projects."""
     return _collect_claude_like_files(clg_base_dir())
+
+
+def clc_session_files():
+    """All top-level *.jsonl session files in CLC (Cursor translator) projects."""
+    return _collect_claude_like_files(clc_base_dir())
+
+
+def cld_session_files():
+    """All top-level *.jsonl session files in CLD (DeepSeek) projects."""
+    return _collect_claude_like_files(cld_base_dir())
 
 
 def cursor_session_files():
@@ -206,6 +234,10 @@ def session_files(source=None):
         return clx_session_files()
     if src == "clg":
         return clg_session_files()
+    if src == "clc":
+        return clc_session_files()
+    if src == "cld":
+        return cld_session_files()
     if src == "cursor":
         return cursor_session_files()
     if src == "grok":
@@ -214,6 +246,7 @@ def session_files(source=None):
         return agy_session_files()
     if src == "all":
         return (claude_session_files() + clx_session_files() + clg_session_files() +
+                clc_session_files() + cld_session_files() +
                 cursor_session_files() + grok_session_files() + agy_session_files())
     return claude_session_files()
 
@@ -259,6 +292,10 @@ def identify_source(path):
         return "clx"
     if ".claude-clg" in str_path:
         return "clg"
+    if ".claude-clc" in str_path:
+        return "clc"
+    if ".claude-cld" in str_path:
+        return "cld"
     if is_cursor_transcript(p) or ".cursor" in str_path:
         return "cursor"
     if is_grok_transcript(p):
@@ -282,6 +319,10 @@ def assistant_label(source):
         return "CLAUDE (clx)"
     if s == "clg":
         return "CLAUDE (clg)"
+    if s == "clc":
+        return "CLAUDE (clc)"
+    if s == "cld":
+        return "CLAUDE (cld)"
     return "CLAUDE"
 
 
@@ -1155,6 +1196,8 @@ def durable_memory_files(project=None):
         _claude_projects_root(),
         Path.home() / ".claude-clx" / "projects",
         Path.home() / ".claude-clg" / "projects",
+        Path.home() / ".claude-clc" / "projects",
+        Path.home() / ".claude-cld" / "projects",
     ):
         if claude_root.exists():
             for memdir in sorted(claude_root.glob("*/memory")):
@@ -2326,12 +2369,13 @@ def build_parser():
         description="Find and read past Claude Code, Grok, Cursor, Antigravity, clx, and clg session transcripts.")
     p.add_argument(
         "--source",
-        choices=("claude", "grok", "cursor", "cursor-agent", "agy", "antigravity", "clx", "clg", "all"),
+        choices=("claude", "grok", "cursor", "cursor-agent", "agy", "antigravity", "clx", "clg", "clc", "cld", "all"),
         default=default_source(),
         help="Which session store to use (default: current Claude profile). "
              "Options: claude (~/.claude), grok (~/.grok), cursor/cursor-agent (~/.cursor), "
              "agy (~/.gemini/antigravity-cli), clx (~/.claude-clx), clg (~/.claude-clg), "
-             "all (searches across all 6 stores).",
+             "clc (~/.claude-clc), cld (~/.claude-cld), "
+             "all (searches across all stores).",
     )
     sub = p.add_subparsers(dest="cmd")
 
