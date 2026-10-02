@@ -15,8 +15,10 @@ description: >-
   ~/.claude-clg/projects, CLC under ~/.claude-clc/projects, CLD under
   ~/.claude-cld/projects, Cursor transcripts under
   ~/.cursor/projects/*/agent-transcripts, Grok sessions under ~/.grok/sessions,
-  and Antigravity (agy) under ~/.gemini/antigravity-cli. Do NOT use it to read
-  normal project source files - only agent session history.
+  and Antigravity (agy) under ~/.gemini/antigravity-cli. Also reads sessions
+  from the user's OTHER computers (e.g. "the session on my laptop", "what I did
+  on the lab machine") via mirrors synced over ssh into ~/.session-mirrors.
+  Do NOT use it to read normal project source files - only agent session history.
 ---
 
 # Reading Past Sessions (Claude + Grok + Cursor + Agy + CLX + CLG)
@@ -43,6 +45,48 @@ stores without blowing the current chat's context window.
 | `--source all` | All session stores | All engines above | Chronologically merged and ranked |
 
 Default source: auto-detected from current Claude profile (`clx` in `CLAUDE_CONFIG_DIR=~/.claude-clx`, `clg` in `~/.claude-clg`, `clc` in `~/.claude-clc`, `cld` in `~/.claude-cld`, otherwise `claude`).
+
+Every store is read on **this machine and on every synced mirror** of another
+machine (see *Other computers* below). Each result shows `machine=<name>`;
+`--machine local` or `--machine <name>` restricts to one.
+
+## Other computers (laptop <-> lab server)
+
+Sessions from another computer are mirrored into
+`~/.session-mirrors/<machine>/` with the same layout as a home dir, so
+`list` / `search` / `show` / `memory-search` find them automatically.
+
+`sync` runs **on the machine that can ssh into the other** (usually the
+laptop, since the lab server cannot reach it). One run goes both ways: it pulls
+the server's own sessions into the laptop's mirror and pushes the laptop's
+sessions into the server's `~/.session-mirrors/<laptop-name>/`. Only changed
+files are sent. The remote needs `sh`, `find` and `tar`; locally only Python and
+an `ssh` client (built into Windows 10+).
+
+```text
+# first time (on the laptop); host and names are remembered afterwards
+python <skill_dir>/scripts/sessions.py sync --host jliu1401@linux-lab-101.ece.uw.edu --name uw-lab --as laptop
+# later
+python <skill_dir>/scripts/sessions.py sync
+python <skill_dir>/scripts/sessions.py sync --status      # mirrors + last sync time
+python <skill_dir>/scripts/sessions.py sync --dry-run     # what would transfer
+```
+
+When the user asks about a session "on my laptop" / "on the lab computer":
+
+1. `sync --status` to see which mirrors exist and how fresh they are.
+2. If this machine has a host configured (`sync` with no args does not print
+   "No remote host configured"), run `sync` first to refresh. It needs ssh key
+   auth to run unattended; if it hangs on or fails at a password prompt, ask the
+   user to run it themselves with `! python ... sync`.
+3. If this is the server side (no host configured), the mirror is only as fresh
+   as the other machine's last `sync`. Say how old it is and, if stale, ask the
+   user to run `sync` on that machine.
+4. Then `list` / `search` / `show` as usual, adding `--machine <name>` if useful.
+
+Mirrored transcripts carry the other machine's paths (`C:\Users\...` vs
+`/home/...`). Translate before re-reading files, and remember the files
+themselves may only exist on the other machine.
 
 ## Safety
 
@@ -71,6 +115,9 @@ On Windows, `py -3` is fine if `python` is missing. No third-party deps.
 | `list [PROJECT] [--limit N] [--source S]` | Recent sessions, newest first. `PROJECT` is an optional case- and separator-insensitive substring of the working directory (e.g. `Trellis`, `EE331`). |
 | `search QUERY [--project P] [--limit N] [--source S]` | Find sessions by content. Searches prose **and tool calls** (file paths, commands) **and tool output** - so an artifact named only inside a tool call is still found. Token- and separator-normalized, ranked by relevance. |
 | `show SESSION [--mode briefing\|full\|prompts] [--all-branches] [--include-subagents] [--max-chars N] [--source S]` | Condensed transcript of one session. `SESSION` is a session id, a partial id, or a file path. If not found in the active source, auto-resolves across all stores. |
+| `sync [--host USER@HOST] [--name N] [--as N] [--pull-only\|--push-only] [--dry-run] [--status]` | Mirror session stores to/from another machine over ssh (see *Other computers*). |
+
+`--source` and `--machine` work before or after the subcommand.
 
 ### Durable-memory commands
 
@@ -164,6 +211,8 @@ JSONL for graphing.
 - User named the platform -> add `--source claude`, `--source grok`, `--source cursor`,
   `--source agy`, `--source clx`, or `--source clg`.
 - Ambiguous which host -> `--source all` for list/search, then confirm.
+- User named another computer ("on my laptop") -> follow *Other computers*
+  above, then add `--machine <name>`.
 
 If several candidates look plausible, show the top few (title, id, source, last-active,
 project) and confirm which one. Do not guess silently when ambiguous.

@@ -37,21 +37,31 @@ Run with no args for help.
 """
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
-import sqlite3
+import socket
 import subprocess
 import sys
+import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote
+
+try:
+    import sqlite3
+except ImportError:  # some builds ship a broken _sqlite3; only agy titles need it
+    sqlite3 = None
 
 # Force UTF-8 output and never let an unencodable character abort a briefing.
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except AttributeError:  # Python < 3.7
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 except Exception:
     pass
 
@@ -135,6 +145,91 @@ def agy_root_dir():
     return Path.home() / ".gemini" / "antigravity-cli"
 
 
+# --------------------------------------------------------------------------
+# Cross-machine mirrors (filled by `sync`)
+# --------------------------------------------------------------------------
+# Session stores relative to a home directory. A mirror of another machine is
+# laid out the same way under ~/.session-mirrors/<machine>/, so every reader
+# below works on local and mirrored stores alike.
+STORE_DIRS = {
+    "claude": ".claude/projects",
+    "clx": ".claude-clx/projects",
+    "clg": ".claude-clg/projects",
+    "clc": ".claude-clc/projects",
+    "cld": ".claude-cld/projects",
+    "cursor": ".cursor/projects",
+    "grok": ".grok/sessions",
+    "agy": ".gemini/antigravity-cli",
+}
+
+LOCAL_STORE_DIRS = {
+    "claude": claude_base_dir,
+    "clx": clx_base_dir,
+    "clg": clg_base_dir,
+    "clc": clc_base_dir,
+    "cld": cld_base_dir,
+    "cursor": cursor_base_dir,
+    "grok": grok_sessions_dir,
+    "agy": agy_root_dir,
+}
+
+# Set from --machine in main(): None = this machine + every mirror,
+# "local" = this machine only, anything else = that one mirror only.
+MACHINE_FILTER = None
+
+
+def mirrors_root():
+    env = os.environ.get("SESSIONS_MIRROR_DIR", "").strip()
+    return Path(env) if env else (Path.home() / ".session-mirrors")
+
+
+def mirror_homes():
+    """[(machine, home)] for each machine mirrored under mirrors_root()."""
+    root = mirrors_root()
+    if not root.is_dir():
+        return []
+    return [(d.name, d) for d in sorted(root.iterdir())
+            if d.is_dir() and not d.name.startswith(".")]
+
+
+def _machine_slug(name):
+    """'linux-lab-121.ece.uw.edu' -> 'linux-lab', 'JONNY-LAPTOP' -> 'jonny-laptop'."""
+    s = str(name).split("@")[-1].split(".")[0].lower()
+    s = re.sub(r"[^a-z0-9_-]+", "-", s).strip("-")
+    s = re.sub(r"-\d+$", "", s)
+    return s or "remote"
+
+
+def local_machine_name():
+    env = os.environ.get("SESSIONS_MACHINE_NAME", "").strip()
+    if env:
+        return _machine_slug(env)
+    cfg = load_sync_config()
+    if cfg.get("local_name"):
+        return cfg["local_name"]
+    return _machine_slug(socket.gethostname())
+
+
+def machine_of(path):
+    """Which machine a session file came from: a mirror name, or this machine."""
+    try:
+        rel = Path(os.path.abspath(str(path))).relative_to(os.path.abspath(str(mirrors_root())))
+        return rel.parts[0]
+    except (ValueError, IndexError):
+        return local_machine_name()
+
+
+def _store_bases(src):
+    """The local dir for store `src` plus the same store in each selected mirror."""
+    bases = []
+    if MACHINE_FILTER in (None, "local", local_machine_name()):
+        bases.append(LOCAL_STORE_DIRS[src]())
+    for name, home in mirror_homes():
+        if MACHINE_FILTER in (None, name):
+            bases.append(home / STORE_DIRS[src])
+    return bases
+
+
 def _collect_claude_like_files(base_path):
     out = []
     if not base_path.exists():
@@ -145,84 +240,89 @@ def _collect_claude_like_files(base_path):
     return out
 
 
+def _claude_like_files(src):
+    return [f for b in _store_bases(src) for f in _collect_claude_like_files(b)]
+
+
 def claude_session_files():
     """All top-level *.jsonl session files in Claude projects."""
-    return _collect_claude_like_files(claude_base_dir())
+    return _claude_like_files("claude")
 
 
 def clx_session_files():
     """All top-level *.jsonl session files in CLX projects."""
-    return _collect_claude_like_files(clx_base_dir())
+    return _claude_like_files("clx")
 
 
 def clg_session_files():
     """All top-level *.jsonl session files in CLG projects."""
-    return _collect_claude_like_files(clg_base_dir())
+    return _claude_like_files("clg")
 
 
 def clc_session_files():
     """All top-level *.jsonl session files in CLC (Cursor translator) projects."""
-    return _collect_claude_like_files(clc_base_dir())
+    return _claude_like_files("clc")
 
 
 def cld_session_files():
     """All top-level *.jsonl session files in CLD (DeepSeek) projects."""
-    return _collect_claude_like_files(cld_base_dir())
+    return _claude_like_files("cld")
 
 
 def cursor_session_files():
     """Cursor IDE/cursor-agent transcripts stored as
     <cursor>/projects/<project>/agent-transcripts/<session-id>/<session-id>.jsonl."""
-    base = cursor_base_dir()
     out = []
-    if not base.exists():
-        return out
-    for proj in base.iterdir():
-        if not proj.is_dir():
+    for base in _store_bases("cursor"):
+        if not base.exists():
             continue
-        transcripts = proj / "agent-transcripts"
-        if not transcripts.exists():
-            continue
-        out.extend(transcripts.glob("*/*.jsonl"))
-        out.extend(transcripts.glob("*.jsonl"))
+        for proj in base.iterdir():
+            if not proj.is_dir():
+                continue
+            transcripts = proj / "agent-transcripts"
+            if not transcripts.exists():
+                continue
+            out.extend(transcripts.glob("*/*.jsonl"))
+            out.extend(transcripts.glob("*.jsonl"))
     return out
 
 
 def grok_session_files():
     """Grok Build session chat files under ~/.grok/sessions/<cwd>/<session-id>/."""
-    root = grok_sessions_dir()
     out = []
-    if not root.exists():
-        return out
-    for cwd_dir in root.iterdir():
-        if not cwd_dir.is_dir() or cwd_dir.name in ("session_search.sqlite",):
+    for root in _store_bases("grok"):
+        if not root.exists():
             continue
-        for sess_dir in cwd_dir.iterdir():
-            if sess_dir.is_dir() and (sess_dir / "summary.json").is_file():
-                chat_file = sess_dir / "chat_history.jsonl"
-                if chat_file.is_file():
-                    out.append(chat_file)
-                else:
-                    out.append(sess_dir / "summary.json")
+        for cwd_dir in root.iterdir():
+            if not cwd_dir.is_dir() or cwd_dir.name in ("session_search.sqlite",):
+                continue
+            for sess_dir in cwd_dir.iterdir():
+                if sess_dir.is_dir() and (sess_dir / "summary.json").is_file():
+                    chat_file = sess_dir / "chat_history.jsonl"
+                    if chat_file.is_file():
+                        out.append(chat_file)
+                    else:
+                        out.append(sess_dir / "summary.json")
     return out
 
 
 def agy_session_files():
     """Antigravity CLI transcripts under ~/.gemini/antigravity-cli/brain/<id>/..."""
-    root = agy_root_dir() / "brain"
     out = []
-    if not root.exists():
-        return out
-    for sess_dir in root.iterdir():
-        if not sess_dir.is_dir():
+    for agy_root in _store_bases("agy"):
+        root = agy_root / "brain"
+        if not root.exists():
             continue
-        t = sess_dir / ".system_generated" / "logs" / "transcript.jsonl"
-        if t.is_file():
-            out.append(t)
-        else:
-            tf = sess_dir / ".system_generated" / "logs" / "transcript_full.jsonl"
-            if tf.is_file():
-                out.append(tf)
+        for sess_dir in root.iterdir():
+            if not sess_dir.is_dir():
+                continue
+            t = sess_dir / ".system_generated" / "logs" / "transcript.jsonl"
+            if t.is_file():
+                out.append(t)
+            else:
+                tf = sess_dir / ".system_generated" / "logs" / "transcript_full.jsonl"
+                if tf.is_file():
+                    out.append(tf)
     return out
 
 
@@ -326,15 +426,25 @@ def assistant_label(source):
     return "CLAUDE"
 
 
-_AGY_SUMMARIES_CACHE = None
+_AGY_SUMMARIES_CACHE = {}
 
-def _load_agy_summaries():
-    global _AGY_SUMMARIES_CACHE
-    if _AGY_SUMMARIES_CACHE is not None:
-        return _AGY_SUMMARIES_CACHE
-    db_path = agy_root_dir() / "conversation_summaries.db"
+def _agy_root_of(path):
+    """The antigravity-cli dir a brain/<id>/... transcript lives under."""
+    parts = Path(path).parts
+    low = [x.lower() for x in parts]
+    if "brain" in low:
+        return Path(*parts[:low.index("brain")])
+    return agy_root_dir()
+
+
+def _load_agy_summaries(root=None):
+    root = Path(root) if root else agy_root_dir()
+    key = str(root)
+    if key in _AGY_SUMMARIES_CACHE:
+        return _AGY_SUMMARIES_CACHE[key]
+    db_path = root / "conversation_summaries.db"
     summaries = {}
-    if db_path.exists():
+    if sqlite3 is not None and db_path.exists():
         try:
             con = sqlite3.connect(str(db_path))
             for row in con.execute("SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris FROM conversation_summaries"):
@@ -358,7 +468,7 @@ def _load_agy_summaries():
             con.close()
         except Exception:
             pass
-    _AGY_SUMMARIES_CACHE = summaries
+    _AGY_SUMMARIES_CACHE[key] = summaries
     return summaries
 
 
@@ -814,7 +924,7 @@ def scan_agy(path, full=False):
     else:
         session_id = p.stem
 
-    sums = _load_agy_summaries()
+    sums = _load_agy_summaries(_agy_root_of(p))
     sum_info = sums.get(str(session_id), {})
     custom_title = sum_info.get("title") or None
     cwd = sum_info.get("cwd") or None
@@ -1097,7 +1207,7 @@ def match_project(path, query):
             pass
     elif src == "agy":
         cid = p.parents[2].name if "brain" in p.parts else p.stem
-        sums = _load_agy_summaries()
+        sums = _load_agy_summaries(_agy_root_of(p))
         if cid in sums:
             folders.append(sums[cid].get("cwd", ""))
             folders.append(sums[cid].get("title", ""))
@@ -1192,13 +1302,16 @@ def durable_memory_files(project=None):
                     if _project_relevant(f, _read_text(f, max_chars=6000), project):
                         add(f, "codex-rollout" if sub == "rollout_summaries" else "codex-note")
 
-    for claude_root in (
+    claude_roots = [
         _claude_projects_root(),
         Path.home() / ".claude-clx" / "projects",
         Path.home() / ".claude-clg" / "projects",
         Path.home() / ".claude-clc" / "projects",
         Path.home() / ".claude-cld" / "projects",
-    ):
+    ]
+    for _name, home in mirror_homes():
+        claude_roots.extend(home / STORE_DIRS[s] for s in ("claude", "clx", "clg", "clc", "cld"))
+    for claude_root in claude_roots:
         if claude_root.exists():
             for memdir in sorted(claude_root.glob("*/memory")):
                 marker = memdir.parent.name + "\n" + _read_text(memdir / "MEMORY.md", max_chars=6000)
@@ -1824,7 +1937,8 @@ def cmd_list(args):
         side = f"  [{m['nside']} subagent]" if m["nside"] else ""
         last_ts = branch_span(m)[1]
         print(f"* {title_of(m)}")
-        print(f"    id={m['session_id']}  source={m.get('source', 'claude')}  last={_fmt_time(last_ts)}"
+        print(f"    id={m['session_id']}  source={m.get('source', 'claude')}  machine={machine_of(f)}"
+              f"  last={_fmt_time(last_ts)}"
               f"  msgs={total} (live {live}){flag}{side}")
         print(f"    project: {project_label(m, f)}")
         print()
@@ -1911,7 +2025,8 @@ def cmd_search(args):
             why.append(f"{at} all-token hit(s)")
         why.append(f"{cov}/{len(tokens)} keyword(s)")
         print(f"{rank}. {title_of(m)}")
-        print(f"    id={m['session_id']}  source={m.get('source', 'claude')}  last={_fmt_time(branch_span(m)[1])}"
+        print(f"    id={m['session_id']}  source={m.get('source', 'claude')}  machine={machine_of(f)}"
+              f"  last={_fmt_time(branch_span(m)[1])}"
               f"  score={score}  ({', '.join(why)})")
         print(f"    project: {project_label(m, f)}")
         if best:
@@ -2054,6 +2169,7 @@ def cmd_show(args):
     print(f"SESSION: {title_of(m)}")
     print(f"  id        : {m['session_id']}")
     print(f"  source    : {m.get('source', 'claude')}")
+    print(f"  machine   : {machine_of(f)}")
     print(f"  project   : {project_label(m, f)}")
     if m.get("git"):
         print(f"  git branch: {m['git']}")
@@ -2363,35 +2479,321 @@ def cmd_memory_query(args):
     cmd_memory_search(fallback)
 
 
-def build_parser():
-    p = argparse.ArgumentParser(
-        prog="sessions.py",
-        description="Find and read past Claude Code, Grok, Cursor, Antigravity, clx, and clg session transcripts.")
-    p.add_argument(
+# --------------------------------------------------------------------------
+# sync: mirror session stores between machines over ssh
+# --------------------------------------------------------------------------
+# Run from the machine that can ssh into the other one (e.g. a laptop that can
+# reach a lab server). One run does both directions:
+#   pull: the remote's own stores  -> ~/.session-mirrors/<remote-name>/  here
+#   push: this machine's own stores -> ~/.session-mirrors/<local-name>/   there
+# Only changed files (by size + mtime) are transferred. The remote must be a
+# POSIX host with sh, find and tar; locally only Python and an ssh client are
+# needed, so this works from Windows too.
+_SYNC_CONFIG_CACHE = None
+
+
+def _sync_config_path():
+    return mirrors_root() / "config.json"
+
+
+def load_sync_config():
+    global _SYNC_CONFIG_CACHE
+    if _SYNC_CONFIG_CACHE is None:
+        try:
+            _SYNC_CONFIG_CACHE = json.loads(_sync_config_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _SYNC_CONFIG_CACHE = {}
+    return _SYNC_CONFIG_CACHE
+
+
+def save_sync_config(cfg):
+    global _SYNC_CONFIG_CACHE
+    path = _sync_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    _SYNC_CONFIG_CACHE = cfg
+
+
+def _sync_wanted(src, rel):
+    """Which files inside a store are worth mirroring (transcripts, titles, memory)."""
+    if src == "agy":
+        return rel == "conversation_summaries.db" or (rel.startswith("brain/") and rel.endswith(".jsonl"))
+    return rel.endswith((".jsonl", ".json", ".md"))
+
+
+def _split_store(arc):
+    """'.claude/projects/x/y.jsonl' -> ('claude', 'x/y.jsonl'), or (None, None)."""
+    for src, prefix in STORE_DIRS.items():
+        if arc.startswith(prefix + "/"):
+            return src, arc[len(prefix) + 1:]
+    return None, None
+
+
+_WIN_BAD = re.compile(r'[<>:"|?*\x00-\x1f]')
+
+
+def _safe_rel(arc):
+    """Validate a tar/manifest path and make it legal on this OS, or None."""
+    parts = [x for x in arc.replace("\\", "/").split("/") if x not in ("", ".")]
+    if not parts or ".." in parts or arc.startswith("/"):
+        return None
+    if os.name == "nt":
+        parts = [_WIN_BAD.sub("_", x).rstrip(" .") or "_" for x in parts]
+    return "/".join(parts)
+
+
+def _local_store_manifest():
+    """{arc: (size, mtime, path)} for this machine's own (non-mirror) stores."""
+    out = {}
+    for src, prefix in STORE_DIRS.items():
+        base = LOCAL_STORE_DIRS[src]()
+        if not base.is_dir():
+            continue
+        for dirpath, _dirs, files in os.walk(str(base)):
+            for fn in files:
+                full = Path(dirpath) / fn
+                rel = full.relative_to(base).as_posix()
+                if not _sync_wanted(src, rel):
+                    continue
+                try:
+                    st = full.stat()
+                except OSError:
+                    continue
+                out[prefix + "/" + rel] = (st.st_size, int(st.st_mtime), full)
+    return out
+
+
+def _dir_manifest(root):
+    """{rel: (size, mtime)} for every file under a mirror dir."""
+    out = {}
+    if not root.is_dir():
+        return out
+    for dirpath, _dirs, files in os.walk(str(root)):
+        for fn in files:
+            full = Path(dirpath) / fn
+            try:
+                st = full.stat()
+            except OSError:
+                continue
+            out[full.relative_to(root).as_posix()] = (st.st_size, int(st.st_mtime))
+    return out
+
+
+def _parse_find_manifest(text):
+    out = {}
+    for line in text.splitlines():
+        bits = line.split("\t")
+        if len(bits) != 3:
+            continue
+        try:
+            out[bits[0]] = (int(bits[1]), int(float(bits[2])))
+        except ValueError:
+            continue
+    return out
+
+
+def _ssh_cmd(host, *remote):
+    ssh = os.environ.get("SESSIONS_SSH", "").strip() or "ssh"
+    return [ssh, "-o", "ServerAliveInterval=15", host] + list(remote)
+
+
+def _ssh_script(host, script):
+    """Run a POSIX sh script on the remote (via stdin, so the login shell can be
+    tcsh/zsh/whatever) and return its stdout bytes."""
+    r = subprocess.run(_ssh_cmd(host, "sh", "-s"), input=script.encode("utf-8"),
+                       stdout=subprocess.PIPE)
+    if r.returncode != 0:
+        raise RuntimeError(f"ssh {host} failed (exit {r.returncode})")
+    return r.stdout
+
+
+def _sh_quote(s):
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def _heredoc(lines):
+    tag = "__RPS_FILES_%s__" % hashlib.md5("\n".join(lines).encode("utf-8")).hexdigest()[:8]
+    return "<<'%s'\n%s\n%s\n" % (tag, "\n".join(lines), tag)
+
+
+def _sync_pull(host, remote_name, dry_run=False):
+    dirs = " ".join(_sh_quote(d) for d in STORE_DIRS.values())
+    script = ('cd "$HOME" || exit 1\n'
+              'for d in %s; do [ -d "$d" ] && find "$d" -type f -printf \'%%p\\t%%s\\t%%T@\\n\'; done\n'
+              'exit 0\n' % dirs)
+    remote = {}
+    for arc, sm in _parse_find_manifest(_ssh_script(host, script).decode("utf-8", "replace")).items():
+        src, rel = _split_store(arc)
+        if src and _sync_wanted(src, rel) and "\n" not in arc:
+            remote[arc] = sm
+    dest = mirrors_root() / remote_name
+    have = _dir_manifest(dest)
+    todo = sorted(a for a, sm in remote.items() if have.get(_safe_rel(a) or "") != sm)
+    size = sum(remote[a][0] for a in todo)
+    print(f"pull {host} -> {dest}: {len(todo)} of {len(remote)} file(s) changed ({size / 1e6:.1f} MB)")
+    if dry_run or not todo:
+        return len(todo)
+
+    script = 'cd "$HOME" || exit 1\ntar czf - -T - ' + _heredoc(todo)
+    proc = subprocess.Popen(_ssh_cmd(host, "sh", "-s"), stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE)
+    proc.stdin.write(script.encode("utf-8"))
+    proc.stdin.close()
+    n = 0
+    with tarfile.open(fileobj=proc.stdout, mode="r|gz") as tar:
+        for member in tar:
+            rel = _safe_rel(member.name)
+            if not member.isfile() or not rel:
+                continue
+            target = dest / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            src = tar.extractfile(member)
+            with open(str(target), "wb") as out:
+                shutil.copyfileobj(src, out)
+            os.utime(str(target), (member.mtime, member.mtime))
+            n += 1
+    if proc.wait() != 0:
+        raise RuntimeError(f"remote tar on {host} failed (exit {proc.returncode})")
+    (dest / ".synced-at").write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
+    print(f"  pulled {n} file(s)")
+    return n
+
+
+def _sync_push(host, local_name, dry_run=False):
+    mine = _local_store_manifest()
+    mdir = '"$HOME/.session-mirrors/%s"' % local_name  # slug: [a-z0-9_-] only
+    script = ('cd %s 2>/dev/null || exit 0\n'
+              'find . -type f -printf \'%%P\\t%%s\\t%%T@\\n\'\n' % mdir)
+    theirs = _parse_find_manifest(_ssh_script(host, script).decode("utf-8", "replace"))
+    todo = sorted(a for a, (sz, mt, _p) in mine.items() if theirs.get(a) != (sz, mt))
+    size = sum(mine[a][0] for a in todo)
+    print(f"push this machine -> {host}:~/.session-mirrors/{local_name}: "
+          f"{len(todo)} of {len(mine)} file(s) changed ({size / 1e6:.1f} MB)")
+    if dry_run or not todo:
+        return len(todo)
+
+    remote_sh = "mkdir -p %s && cd %s && tar xzf -" % (mdir, mdir)
+    proc = subprocess.Popen(_ssh_cmd(host, "sh -c " + _sh_quote(remote_sh)),
+                            stdin=subprocess.PIPE)
+    n = 0
+    with tarfile.open(fileobj=proc.stdin, mode="w|gz") as tar:
+        for arc in todo:
+            try:
+                tar.add(str(mine[arc][2]), arcname=arc, recursive=False)
+                n += 1
+            except OSError as e:
+                print(f"  skip {arc}: {e}", file=sys.stderr)
+        stamp = (datetime.now(timezone.utc).isoformat() + "\n").encode("utf-8")
+        info = tarfile.TarInfo(".synced-at")
+        info.size = len(stamp)
+        info.mtime = int(datetime.now().timestamp())
+        tar.addfile(info, io.BytesIO(stamp))
+    proc.stdin.close()
+    if proc.wait() != 0:
+        raise RuntimeError(f"remote untar on {host} failed (exit {proc.returncode})")
+    print(f"  pushed {n} file(s)")
+    return n
+
+
+def _print_mirror_status():
+    homes = mirror_homes()
+    print(f"this machine: {local_machine_name()}   mirrors dir: {mirrors_root()}")
+    if not homes:
+        print("  no mirrors yet")
+    for name, home in homes:
+        stamp = _read_text(home / ".synced-at").strip() or "?"
+        print(f"  {name}: last synced {_fmt_time(stamp)} UTC")
+
+
+def cmd_sync(args):
+    cfg = dict(load_sync_config())
+    if args.status:
+        _print_mirror_status()
+        return
+    host = args.host or cfg.get("host")
+    if not host:
+        print("No remote host configured. From the machine that can ssh into the other, run:\n"
+              "  python sessions.py sync --host USER@HOST [--name REMOTE_NAME] [--as LOCAL_NAME]\n"
+              "That pulls the remote's sessions here and pushes this machine's there.\n")
+        _print_mirror_status()
+        return
+    remotes = cfg.setdefault("remotes", {})
+    remote_name = _machine_slug(args.name or remotes.get(host) or host)
+    local_name = _machine_slug(args.as_name or cfg.get("local_name") or socket.gethostname())
+    if remote_name == local_name:
+        print(f"Remote and local machine names are both '{local_name}'; pass --name or --as.")
+        sys.exit(2)
+    if not args.dry_run:
+        cfg["host"] = host
+        cfg["local_name"] = local_name
+        remotes[host] = remote_name
+        save_sync_config(cfg)
+    try:
+        if not args.push_only:
+            _sync_pull(host, remote_name, args.dry_run)
+        if not args.pull_only:
+            _sync_push(host, local_name, args.dry_run)
+    except (RuntimeError, OSError, tarfile.TarError) as e:
+        print(f"sync failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def add_store_args(parser, source_default, machine_default):
+    parser.add_argument(
         "--source",
         choices=("claude", "grok", "cursor", "cursor-agent", "agy", "antigravity", "clx", "clg", "clc", "cld", "all"),
-        default=default_source(),
+        default=source_default,
         help="Which session store to use (default: current Claude profile). "
              "Options: claude (~/.claude), grok (~/.grok), cursor/cursor-agent (~/.cursor), "
              "agy (~/.gemini/antigravity-cli), clx (~/.claude-clx), clg (~/.claude-clg), "
              "clc (~/.claude-clc), cld (~/.claude-cld), "
              "all (searches across all stores).",
     )
+    parser.add_argument(
+        "--machine",
+        default=machine_default,
+        help="Restrict to one machine: 'local' (this one) or a mirror name from "
+             "`sync --status`. Default: this machine plus every synced mirror.",
+    )
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="sessions.py",
+        description="Find and read past Claude Code, Grok, Cursor, Antigravity, clx, and clg session transcripts.")
+    add_store_args(p, default_source(), None)
+    # Same flags after the subcommand; SUPPRESS keeps them from clobbering the
+    # values given before it.
+    common = argparse.ArgumentParser(add_help=False)
+    add_store_args(common, argparse.SUPPRESS, argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd")
 
-    pl = sub.add_parser("list", help="recent sessions, newest first")
+    py = sub.add_parser("sync", help="mirror session stores to/from another machine over ssh")
+    py.add_argument("--host", default=None,
+                    help="USER@HOST to sync with; remembered after the first run")
+    py.add_argument("--name", default=None,
+                    help="name for the remote's mirror here (default: derived from host)")
+    py.add_argument("--as", dest="as_name", default=None,
+                    help="name for this machine's mirror on the remote (default: hostname)")
+    py.add_argument("--pull-only", action="store_true")
+    py.add_argument("--push-only", action="store_true")
+    py.add_argument("--dry-run", action="store_true", help="only report what would transfer")
+    py.add_argument("--status", action="store_true", help="show mirrors and last sync times")
+    py.set_defaults(func=cmd_sync)
+
+    pl = sub.add_parser("list", parents=[common], help="recent sessions, newest first")
     pl.add_argument("project", nargs="?", default=None,
                     help="optional project filter (substring of cwd/folder)")
     pl.add_argument("--limit", type=int, default=15)
     pl.set_defaults(func=cmd_list)
 
-    ps = sub.add_parser("search", help="find sessions by content/title")
+    ps = sub.add_parser("search", parents=[common], help="find sessions by content/title")
     ps.add_argument("query")
     ps.add_argument("--project", default=None)
     ps.add_argument("--limit", type=int, default=10)
     ps.set_defaults(func=cmd_search)
 
-    ph = sub.add_parser("show", help="condensed transcript of one session")
+    ph = sub.add_parser("show", parents=[common], help="condensed transcript of one session")
     ph.add_argument("session", help="session id, partial id, or file path")
     ph.add_argument("--mode", choices=["briefing", "full", "prompts"],
                     default="briefing")
@@ -2475,6 +2877,9 @@ def main(argv):
     if not getattr(args, "cmd", None):
         parser.print_help()
         return
+    global MACHINE_FILTER
+    if args.machine and args.machine.lower() != "all":
+        MACHINE_FILTER = args.machine
     args.func(args)
 
 
