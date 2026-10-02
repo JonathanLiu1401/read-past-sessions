@@ -2,7 +2,7 @@
 
 A cross-agent skill for finding and reading past session transcripts across
 **Claude Code**, **Grok**, **Cursor IDE / cursor-agent CLI**, **Antigravity (agy)**,
-**clx**, **clg**, **clc**, and **cld**, turning them into concise context briefings for the
+**clx**, **clg**, **clc**, **cld**, and **clo**, turning them into concise context briefings for the
 current chat.
 
 Use it when you want to fork off, continue, resume, or pick up from a previous
@@ -22,12 +22,13 @@ agent sessions without rereading raw transcript JSONL files.
 | **CLG** | `--source clg` | `~/.claude-clg/projects/<cwd>/*.jsonl` | Claude Code on Gemini via CLIProxyAPI |
 | **CLC** | `--source clc` | `~/.claude-clc/projects/<cwd>/*.jsonl` | Claude Code on Cursor via local translator |
 | **CLD** | `--source cld` | `~/.claude-cld/projects/<cwd>/*.jsonl` | Claude Code on DeepSeek |
+| **CLO** | `--source clo` | `~/.claude-clo/projects/<cwd>/*.jsonl` | Claude Code on OpenRouter |
 | **Cursor** | `--source cursor` or `--source cursor-agent` | `~/.cursor/projects/<cwd>/agent-transcripts/*/*.jsonl` | Cursor IDE and cursor-agent CLI |
 | **Grok Build** | `--source grok` | `~/.grok/sessions/<url-encoded-cwd>/<id>/` | Grok Build CLI / TUI |
 | **Antigravity** | `--source agy` or `--source antigravity` | `~/.gemini/antigravity-cli/brain/<id>/...` | Antigravity CLI transcripts |
 | **All Stores** | `--source all` | All engines above | Chronologically merged and ranked |
 
-Default source: auto-detected from current Claude profile (`clx` / `clg` / `clc` / `cld` via `CLAUDE_CONFIG_DIR`, otherwise `claude`).
+Default source: auto-detected from current Claude profile (`clx` / `clg` / `clc` / `cld` / `clo` via `CLAUDE_CONFIG_DIR`, otherwise `claude`).
 
 ## The engine
 
@@ -36,7 +37,7 @@ transcripts directly. Those files can be tens of MB and contain abandoned turns,
 system prompts, and large tool outputs.
 
 ```powershell
-python scripts/sessions.py [--source claude|clx|clg|clc|cld|cursor|grok|agy|all] <command> ...
+python scripts/sessions.py [--source claude|clx|clg|clc|cld|clo|cursor|grok|agy|all] <command> ...
 ```
 
 | Command | Purpose |

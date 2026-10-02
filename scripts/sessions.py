@@ -11,6 +11,7 @@ Session stores supported:
   * clg: Claude Code (Gemini via CLIProxyAPI) at ~/.claude-clg/projects/<cwd>/*.jsonl
   * clc: Claude Code (Cursor translator) at ~/.claude-clc/projects/<cwd>/*.jsonl
   * cld: Claude Code (DeepSeek) at ~/.claude-cld/projects/<cwd>/*.jsonl
+  * clo: Claude Code (OpenRouter) at ~/.claude-clo/projects/<cwd>/*.jsonl
   * cursor / cursor-agent: Cursor sessions at ~/.cursor/projects/<cwd>/agent-transcripts/*/*.jsonl
   * grok: Grok Build sessions at ~/.grok/sessions/<url-encoded-cwd>/<id>/
   * agy / antigravity: Antigravity CLI at ~/.gemini/antigravity-cli/brain/<id>/...
@@ -79,6 +80,8 @@ def default_source():
         return "clc"
     if cfg.endswith("-cld"):
         return "cld"
+    if cfg.endswith("-clo"):
+        return "clo"
     return "claude"
 
 
@@ -95,7 +98,7 @@ def normalize_source(src):
 
 def claude_base_dir():
     cfg = os.environ.get("CLAUDE_CONFIG_DIR")
-    if cfg and not any(cfg.endswith(s) for s in ("-clx", "-clg", "-clc", "-cld")):
+    if cfg and not any(cfg.endswith(s) for s in ("-clx", "-clg", "-clc", "-cld", "-clo")):
         root = Path(cfg)
     else:
         root = Path.home() / ".claude"
@@ -123,6 +126,12 @@ def clc_base_dir():
 def cld_base_dir():
     cfg = os.environ.get("CLD_CONFIG_DIR")
     root = Path(cfg) if cfg else (Path.home() / ".claude-cld")
+    return root / "projects"
+
+
+def clo_base_dir():
+    cfg = os.environ.get("CLO_CONFIG_DIR")
+    root = Path(cfg) if cfg else (Path.home() / ".claude-clo")
     return root / "projects"
 
 
@@ -157,6 +166,7 @@ STORE_DIRS = {
     "clg": ".claude-clg/projects",
     "clc": ".claude-clc/projects",
     "cld": ".claude-cld/projects",
+    "clo": ".claude-clo/projects",
     "cursor": ".cursor/projects",
     "grok": ".grok/sessions",
     "agy": ".gemini/antigravity-cli",
@@ -168,6 +178,7 @@ LOCAL_STORE_DIRS = {
     "clg": clg_base_dir,
     "clc": clc_base_dir,
     "cld": cld_base_dir,
+    "clo": clo_base_dir,
     "cursor": cursor_base_dir,
     "grok": grok_sessions_dir,
     "agy": agy_root_dir,
@@ -269,6 +280,11 @@ def cld_session_files():
     return _claude_like_files("cld")
 
 
+def clo_session_files():
+    """All top-level *.jsonl session files in CLO (OpenRouter) projects."""
+    return _claude_like_files("clo")
+
+
 def cursor_session_files():
     """Cursor IDE/cursor-agent transcripts stored as
     <cursor>/projects/<project>/agent-transcripts/<session-id>/<session-id>.jsonl."""
@@ -338,6 +354,8 @@ def session_files(source=None):
         return clc_session_files()
     if src == "cld":
         return cld_session_files()
+    if src == "clo":
+        return clo_session_files()
     if src == "cursor":
         return cursor_session_files()
     if src == "grok":
@@ -346,7 +364,7 @@ def session_files(source=None):
         return agy_session_files()
     if src == "all":
         return (claude_session_files() + clx_session_files() + clg_session_files() +
-                clc_session_files() + cld_session_files() +
+                clc_session_files() + cld_session_files() + clo_session_files() +
                 cursor_session_files() + grok_session_files() + agy_session_files())
     return claude_session_files()
 
@@ -396,6 +414,8 @@ def identify_source(path):
         return "clc"
     if ".claude-cld" in str_path:
         return "cld"
+    if ".claude-clo" in str_path:
+        return "clo"
     if is_cursor_transcript(p) or ".cursor" in str_path:
         return "cursor"
     if is_grok_transcript(p):
@@ -423,6 +443,8 @@ def assistant_label(source):
         return "CLAUDE (clc)"
     if s == "cld":
         return "CLAUDE (cld)"
+    if s == "clo":
+        return "CLAUDE (clo)"
     return "CLAUDE"
 
 
@@ -1308,9 +1330,10 @@ def durable_memory_files(project=None):
         Path.home() / ".claude-clg" / "projects",
         Path.home() / ".claude-clc" / "projects",
         Path.home() / ".claude-cld" / "projects",
+        Path.home() / ".claude-clo" / "projects",
     ]
     for _name, home in mirror_homes():
-        claude_roots.extend(home / STORE_DIRS[s] for s in ("claude", "clx", "clg", "clc", "cld"))
+        claude_roots.extend(home / STORE_DIRS[s] for s in ("claude", "clx", "clg", "clc", "cld", "clo"))
     for claude_root in claude_roots:
         if claude_root.exists():
             for memdir in sorted(claude_root.glob("*/memory")):
@@ -2741,12 +2764,12 @@ def cmd_sync(args):
 def add_store_args(parser, source_default, machine_default):
     parser.add_argument(
         "--source",
-        choices=("claude", "grok", "cursor", "cursor-agent", "agy", "antigravity", "clx", "clg", "clc", "cld", "all"),
+        choices=("claude", "grok", "cursor", "cursor-agent", "agy", "antigravity", "clx", "clg", "clc", "cld", "clo", "all"),
         default=source_default,
         help="Which session store to use (default: current Claude profile). "
              "Options: claude (~/.claude), grok (~/.grok), cursor/cursor-agent (~/.cursor), "
              "agy (~/.gemini/antigravity-cli), clx (~/.claude-clx), clg (~/.claude-clg), "
-             "clc (~/.claude-clc), cld (~/.claude-cld), "
+             "clc (~/.claude-clc), cld (~/.claude-cld), clo (~/.claude-clo), "
              "all (searches across all stores).",
     )
     parser.add_argument(

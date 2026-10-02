@@ -2,7 +2,7 @@
 name: read-past-sessions
 description: >-
   Find and read PAST agent sessions across Claude Code, Grok, Cursor
-  IDE/cursor-agent CLI, Antigravity (agy), clx, clg, clc, and cld transcripts stored on
+  IDE/cursor-agent CLI, Antigravity (agy), clx, clg, clc, cld, and clo transcripts stored on
   disk and turn one into a context briefing for the current chat. Use this
   WHENEVER the user wants to fork off, continue, resume, or pick up from a
   previous session or chat; remember/recall what was done in an earlier
@@ -13,7 +13,7 @@ description: >-
   lives in an earlier session rather than the current one. Covers Claude Code
   JSONL under ~/.claude/projects, CLX under ~/.claude-clx/projects, CLG under
   ~/.claude-clg/projects, CLC under ~/.claude-clc/projects, CLD under
-  ~/.claude-cld/projects, Cursor transcripts under
+  ~/.claude-cld/projects, CLO under ~/.claude-clo/projects, Cursor transcripts under
   ~/.cursor/projects/*/agent-transcripts, Grok sessions under ~/.grok/sessions,
   and Antigravity (agy) under ~/.gemini/antigravity-cli. Also reads sessions
   from the user's OTHER computers (e.g. "the session on my laptop", "what I did
@@ -39,12 +39,13 @@ stores without blowing the current chat's context window.
 | `--source clg` | Claude Code (Gemini profile) | `~/.claude-clg/projects/<cwd>/*.jsonl` | Claude JSONL tree |
 | `--source clc` | Claude Code (Cursor translator) | `~/.claude-clc/projects/<cwd>/*.jsonl` | Claude JSONL tree |
 | `--source cld` | Claude Code (DeepSeek profile) | `~/.claude-cld/projects/<cwd>/*.jsonl` | Claude JSONL tree |
+| `--source clo` | Claude Code (OpenRouter profile) | `~/.claude-clo/projects/<cwd>/*.jsonl` | Claude JSONL tree |
 | `--source cursor` or `--source cursor-agent` | Cursor IDE / cursor-agent CLI | `~/.cursor/projects/<cwd>/agent-transcripts/*/*.jsonl` | Cursor turn stream |
 | `--source grok` | Grok Build CLI / TUI | `~/.grok/sessions/<url-encoded-cwd>/<id>/` | `summary.json` + `chat_history.jsonl` |
 | `--source agy` or `--source antigravity` | Antigravity CLI | `~/.gemini/antigravity-cli/brain/<id>/...` | `conversation_summaries.db` + `transcript.jsonl` |
 | `--source all` | All session stores | All engines above | Chronologically merged and ranked |
 
-Default source: auto-detected from current Claude profile (`clx` in `CLAUDE_CONFIG_DIR=~/.claude-clx`, `clg` in `~/.claude-clg`, `clc` in `~/.claude-clc`, `cld` in `~/.claude-cld`, otherwise `claude`).
+Default source: auto-detected from current Claude profile (`clx` in `CLAUDE_CONFIG_DIR=~/.claude-clx`, `clg` in `~/.claude-clg`, `clc` in `~/.claude-clc`, `cld` in `~/.claude-cld`, `clo` in `~/.claude-clo`, otherwise `claude`).
 
 Every store is read on **this machine and on every synced mirror** of another
 machine (see *Other computers* below). Each result shows `machine=<name>`;
