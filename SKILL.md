@@ -73,13 +73,20 @@ python <skill_dir>/scripts/sessions.py sync --status      # mirrors + last sync 
 python <skill_dir>/scripts/sessions.py sync --dry-run     # what would transfer
 ```
 
+**Auto-sync.** Once a host is configured, `list`, `search`, `show`,
+`memory-search` and `memory-query` refresh the mirrors themselves before
+reading (both directions, incremental, at most once every 5 minutes). It uses
+ssh batch mode, so it never prompts; on any failure it prints one
+`auto-sync skipped (...)` line on stderr and reads the existing mirrors. Skip it
+with `--no-sync` or `SESSIONS_AUTO_SYNC=0`; change the interval with
+`SESSIONS_AUTO_SYNC_MINUTES`. Do not run `sync` by hand before every read.
+
 When the user asks about a session "on my laptop" / "on the lab computer":
 
 1. `sync --status` to see which mirrors exist and how fresh they are.
-2. If this machine has a host configured (`sync` with no args does not print
-   "No remote host configured"), run `sync` first to refresh. It needs ssh key
-   auth to run unattended; if it hangs on or fails at a password prompt, ask the
-   user to run it themselves with `! python ... sync`.
+2. If an `auto-sync skipped` line appeared, run `sync` once to see the full
+   error. If it is a password / publickey failure, ssh key auth is missing: ask
+   the user to set it up (README) or run `! python ... sync` themselves.
 3. If this is the server side (no host configured), the mirror is only as fresh
    as the other machine's last `sync`. Say how old it is and, if stale, ask the
    user to run `sync` on that machine.
@@ -118,7 +125,7 @@ On Windows, `py -3` is fine if `python` is missing. No third-party deps.
 | `show SESSION [--mode briefing\|full\|prompts] [--all-branches] [--include-subagents] [--max-chars N] [--source S]` | Condensed transcript of one session. `SESSION` is a session id, a partial id, or a file path. If not found in the active source, auto-resolves across all stores. |
 | `sync [--host USER@HOST] [--name N] [--as N] [--pull-only\|--push-only] [--dry-run] [--status]` | Mirror session stores to/from another machine over ssh (see *Other computers*). |
 
-`--source` and `--machine` work before or after the subcommand.
+`--source` and `--machine` work before or after the subcommand. Read commands auto-sync first unless `--no-sync`.
 
 ### Durable-memory commands
 

@@ -37,6 +37,7 @@ Subcommands:
 Run with no args for help.
 """
 import argparse
+import contextlib
 import hashlib
 import io
 import json
@@ -2615,16 +2616,26 @@ def _parse_find_manifest(text):
     return out
 
 
+# Auto-sync must never stop at a password prompt or hang on an unreachable
+# host, so it runs ssh in batch mode with a connect timeout.
+_SSH_BATCH = False
+
+
 def _ssh_cmd(host, *remote):
     ssh = os.environ.get("SESSIONS_SSH", "").strip() or "ssh"
-    return [ssh, "-o", "ServerAliveInterval=15", host] + list(remote)
+    opts = ["-o", "ServerAliveInterval=15"]
+    if _SSH_BATCH:
+        opts += ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                 "-o", "ServerAliveCountMax=2"]
+    return [ssh] + opts + [host] + list(remote)
 
 
 def _ssh_script(host, script):
     """Run a POSIX sh script on the remote (via stdin, so the login shell can be
     tcsh/zsh/whatever) and return its stdout bytes."""
     r = subprocess.run(_ssh_cmd(host, "sh", "-s"), input=script.encode("utf-8"),
-                       stdout=subprocess.PIPE)
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE if _SSH_BATCH else None,
+                       timeout=120 if _SSH_BATCH else None)
     if r.returncode != 0:
         raise RuntimeError(f"ssh {host} failed (exit {r.returncode})")
     return r.stdout
@@ -2728,6 +2739,91 @@ def _print_mirror_status():
         print(f"  {name}: last synced {_fmt_time(stamp)} UTC")
 
 
+AUTO_SYNC_CMDS = ("list", "search", "show", "memory-search", "memory-query")
+
+
+def _auto_sync_minutes():
+    try:
+        return float(os.environ.get("SESSIONS_AUTO_SYNC_MINUTES", "5"))
+    except ValueError:
+        return 5.0
+
+
+@contextlib.contextmanager
+def _sync_lock():
+    """Yield True if this process holds the sync lock, False if another sync
+    is running. A lock older than 30 minutes is treated as stale."""
+    root = mirrors_root()
+    root.mkdir(parents=True, exist_ok=True)
+    lock = root / ".sync.lock"
+    held = False
+    for _ in range(2):
+        try:
+            os.close(os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            held = True
+            break
+        except FileExistsError:
+            try:
+                if datetime.now().timestamp() - lock.stat().st_mtime < 1800:
+                    break
+                lock.unlink()
+            except OSError:
+                break
+    try:
+        yield held
+    finally:
+        if held:
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+
+
+def auto_sync(args):
+    """Refresh mirrors before reading, if this machine has a sync host.
+
+    Runs at most once per SESSIONS_AUTO_SYNC_MINUTES (default 5), never prompts,
+    reports on stderr, and falls back to the existing mirrors on any failure.
+    Disable with --no-sync or SESSIONS_AUTO_SYNC=0."""
+    global _SSH_BATCH
+    if getattr(args, "cmd", None) not in AUTO_SYNC_CMDS or getattr(args, "no_sync", False):
+        return
+    if os.environ.get("SESSIONS_AUTO_SYNC", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    if MACHINE_FILTER == "local":
+        return
+    cfg = load_sync_config()
+    host = cfg.get("host")
+    remote_name = (cfg.get("remotes") or {}).get(host)
+    local_name = cfg.get("local_name")
+    if not (host and remote_name and local_name):
+        return
+    stamp = mirrors_root() / ".auto-sync-at"
+    try:
+        if datetime.now().timestamp() - stamp.stat().st_mtime < _auto_sync_minutes() * 60:
+            return
+    except OSError:
+        pass
+    with _sync_lock() as held:
+        if not held:
+            print("auto-sync: another sync is running; using existing mirrors", file=sys.stderr)
+            return
+        # Stamp before trying, so an unreachable host costs one timeout per
+        # interval rather than one per command.
+        stamp.write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
+        _SSH_BATCH = True
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                print(f"auto-sync with {remote_name} ({host})")
+                _sync_pull(host, remote_name)
+                _sync_push(host, local_name)
+        except (RuntimeError, OSError, tarfile.TarError, subprocess.SubprocessError) as e:
+            print(f"auto-sync skipped ({e}); using existing mirrors. "
+                  "Run `sessions.py sync` to see the full error.", file=sys.stderr)
+        finally:
+            _SSH_BATCH = False
+
+
 def cmd_sync(args):
     cfg = dict(load_sync_config())
     if args.status:
@@ -2751,14 +2847,21 @@ def cmd_sync(args):
         cfg["local_name"] = local_name
         remotes[host] = remote_name
         save_sync_config(cfg)
-    try:
-        if not args.push_only:
-            _sync_pull(host, remote_name, args.dry_run)
-        if not args.pull_only:
-            _sync_push(host, local_name, args.dry_run)
-    except (RuntimeError, OSError, tarfile.TarError) as e:
-        print(f"sync failed: {e}", file=sys.stderr)
-        sys.exit(1)
+    with _sync_lock() as held:
+        if not held:
+            print("Another sync is running (lock: %s)." % (mirrors_root() / ".sync.lock"))
+            sys.exit(1)
+        try:
+            if not args.push_only:
+                _sync_pull(host, remote_name, args.dry_run)
+            if not args.pull_only:
+                _sync_push(host, local_name, args.dry_run)
+        except (RuntimeError, OSError, tarfile.TarError) as e:
+            print(f"sync failed: {e}", file=sys.stderr)
+            sys.exit(1)
+        if not args.dry_run:
+            (mirrors_root() / ".auto-sync-at").write_text(
+                datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
 
 
 def add_store_args(parser, source_default, machine_default):
@@ -2777,6 +2880,12 @@ def add_store_args(parser, source_default, machine_default):
         default=machine_default,
         help="Restrict to one machine: 'local' (this one) or a mirror name from "
              "`sync --status`. Default: this machine plus every synced mirror.",
+    )
+    parser.add_argument(
+        "--no-sync",
+        action="store_true",
+        default=argparse.SUPPRESS if source_default is argparse.SUPPRESS else False,
+        help="Skip the automatic mirror refresh before reading (see `sync`).",
     )
 
 
@@ -2903,6 +3012,7 @@ def main(argv):
     global MACHINE_FILTER
     if args.machine and args.machine.lower() != "all":
         MACHINE_FILTER = args.machine
+    auto_sync(args)
     args.func(args)
 
 

@@ -98,7 +98,13 @@ ssh-keygen -t ed25519
 type $env:USERPROFILE\.ssh\id_ed25519.pub | ssh jliu1401@linux-lab-101.ece.uw.edu "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
 ```
 
-Environment overrides: `SESSIONS_MIRROR_DIR` (mirror location),
+After that, `list` / `search` / `show` / `memory-search` / `memory-query`
+auto-sync before reading (incremental, both directions, at most once every 5
+minutes, never prompts, falls back to the existing mirrors if the host is
+unreachable). Turn it off per call with `--no-sync`.
+
+Environment overrides: `SESSIONS_AUTO_SYNC=0` (disable auto-sync),
+`SESSIONS_AUTO_SYNC_MINUTES` (interval, default 5), `SESSIONS_MIRROR_DIR` (mirror location),
 `SESSIONS_MACHINE_NAME` (this machine's name), `SESSIONS_SSH` (ssh binary).
 
 ## Installation
