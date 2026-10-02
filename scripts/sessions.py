@@ -58,6 +58,11 @@ except ImportError:  # some builds ship a broken _sqlite3; only agy titles need 
     sqlite3 = None
 
 # Force UTF-8 output and never let an unencodable character abort a briefing.
+# Under pythonw (the scheduled sync task) there is no console at all.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -2630,12 +2635,19 @@ def _ssh_cmd(host, *remote):
     return [ssh] + opts + [host] + list(remote)
 
 
+def _bg_kwargs():
+    """Keep ssh.exe from flashing a console window during background syncs."""
+    if _SSH_BATCH and os.name == "nt":
+        return {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+    return {}
+
+
 def _ssh_script(host, script):
     """Run a POSIX sh script on the remote (via stdin, so the login shell can be
     tcsh/zsh/whatever) and return its stdout bytes."""
     r = subprocess.run(_ssh_cmd(host, "sh", "-s"), input=script.encode("utf-8"),
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE if _SSH_BATCH else None,
-                       timeout=120 if _SSH_BATCH else None)
+                       timeout=120 if _SSH_BATCH else None, **_bg_kwargs())
     if r.returncode != 0:
         raise RuntimeError(f"ssh {host} failed (exit {r.returncode})")
     return r.stdout
@@ -2670,7 +2682,7 @@ def _sync_pull(host, remote_name, dry_run=False):
 
     script = 'cd "$HOME" || exit 1\ntar czf - -T - ' + _heredoc(todo)
     proc = subprocess.Popen(_ssh_cmd(host, "sh", "-s"), stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE)
+                            stdout=subprocess.PIPE, **_bg_kwargs())
     proc.stdin.write(script.encode("utf-8"))
     proc.stdin.close()
     n = 0
@@ -2708,7 +2720,7 @@ def _sync_push(host, local_name, dry_run=False):
 
     remote_sh = "mkdir -p %s && cd %s && tar xzf -" % (mdir, mdir)
     proc = subprocess.Popen(_ssh_cmd(host, "sh -c " + _sh_quote(remote_sh)),
-                            stdin=subprocess.PIPE)
+                            stdin=subprocess.PIPE, **_bg_kwargs())
     n = 0
     with tarfile.open(fileobj=proc.stdin, mode="w|gz") as tar:
         for arc in todo:
@@ -2729,6 +2741,23 @@ def _sync_push(host, local_name, dry_run=False):
     return n
 
 
+def _mirror_age_minutes(home):
+    try:
+        return (datetime.now().timestamp() - (home / ".synced-at").stat().st_mtime) / 60
+    except OSError:
+        return None
+
+
+def _fmt_age(minutes):
+    if minutes is None:
+        return "never"
+    if minutes < 90:
+        return "%d min ago" % minutes
+    if minutes < 48 * 60:
+        return "%.1f h ago" % (minutes / 60)
+    return "%.1f days ago" % (minutes / 1440)
+
+
 def _print_mirror_status():
     homes = mirror_homes()
     print(f"this machine: {local_machine_name()}   mirrors dir: {mirrors_root()}")
@@ -2736,7 +2765,24 @@ def _print_mirror_status():
         print("  no mirrors yet")
     for name, home in homes:
         stamp = _read_text(home / ".synced-at").strip() or "?"
-        print(f"  {name}: last synced {_fmt_time(stamp)} UTC")
+        print(f"  {name}: last synced {_fmt_time(stamp)} UTC ({_fmt_age(_mirror_age_minutes(home))})")
+    sched = load_sync_config().get("schedule_minutes")
+    if sched:
+        print(f"  background sync from this machine: every {sched} min")
+
+
+STALE_MIRROR_MINUTES = 60
+
+
+def _note_stale_mirrors():
+    """On the side that cannot reach the other machine, say how old its mirrors are."""
+    for name, home in mirror_homes():
+        if MACHINE_FILTER not in (None, name):
+            continue
+        age = _mirror_age_minutes(home)
+        if age is not None and age > STALE_MIRROR_MINUTES:
+            print(f"note: sessions from '{name}' were last synced {_fmt_age(age)}; newer work "
+                  f"there appears once '{name}' is on and syncing.", file=sys.stderr)
 
 
 AUTO_SYNC_CMDS = ("list", "search", "show", "memory-search", "memory-query")
@@ -2797,6 +2843,7 @@ def auto_sync(args):
     remote_name = (cfg.get("remotes") or {}).get(host)
     local_name = cfg.get("local_name")
     if not (host and remote_name and local_name):
+        _note_stale_mirrors()
         return
     stamp = mirrors_root() / ".auto-sync-at"
     try:
@@ -2824,18 +2871,80 @@ def auto_sync(args):
             _SSH_BATCH = False
 
 
+SCHEDULE_TASK = "read-past-sessions-sync"
+
+
+def _start_batch_log():
+    """Background mode: never prompt, and log to ~/.session-mirrors/sync.log."""
+    global _SSH_BATCH
+    _SSH_BATCH = True
+    log = mirrors_root() / "sync.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if log.stat().st_size > 1000000:
+            log.unlink()
+    except OSError:
+        pass
+    sys.stdout = sys.stderr = open(str(log), "a", encoding="utf-8")
+    print(f"--- {datetime.now().isoformat(timespec='seconds')}")
+
+
+def _schedule(cfg, args):
+    """Install or remove a background `sync --batch` on this machine."""
+    script = os.path.abspath(__file__)
+    if args.uninstall_schedule:
+        if os.name == "nt":
+            subprocess.run(["schtasks", "/Delete", "/F", "/TN", SCHEDULE_TASK])
+        else:
+            print("Remove the read-past-sessions line from `crontab -e`.")
+        cfg.pop("schedule_minutes", None)
+        save_sync_config(cfg)
+        return
+    if not cfg.get("host"):
+        print("Run `sync --host USER@HOST --name N --as N` once before scheduling it.")
+        sys.exit(2)
+    minutes = max(1, args.install_schedule)
+    if os.name == "nt":
+        exe = Path(sys.executable)
+        if exe.with_name("pythonw.exe").exists():
+            exe = exe.with_name("pythonw.exe")  # no console window every run
+        tr = '"%s" "%s" sync --batch' % (exe, script)
+        r = subprocess.run(["schtasks", "/Create", "/F", "/SC", "MINUTE", "/MO", str(minutes),
+                            "/TN", SCHEDULE_TASK, "/TR", tr])
+        if r.returncode != 0:
+            print("schtasks failed; nothing scheduled.", file=sys.stderr)
+            sys.exit(1)
+        print(f"Scheduled task '{SCHEDULE_TASK}': {tr} every {minutes} min "
+              f"(log: {mirrors_root() / 'sync.log'})")
+    else:
+        print("Add this line with `crontab -e`:\n"
+              f"*/{minutes} * * * * {sys.executable} {script} sync --batch")
+    cfg["schedule_minutes"] = minutes
+    save_sync_config(cfg)
+
+
 def cmd_sync(args):
     cfg = dict(load_sync_config())
     if args.status:
         _print_mirror_status()
         return
     host = args.host or cfg.get("host")
+    if args.install_schedule is not None or args.uninstall_schedule:
+        _schedule(cfg, args)
+        return
     if not host:
-        print("No remote host configured. From the machine that can ssh into the other, run:\n"
-              "  python sessions.py sync --host USER@HOST [--name REMOTE_NAME] [--as LOCAL_NAME]\n"
-              "That pulls the remote's sessions here and pushes this machine's there.\n")
+        if mirror_homes():
+            print("This machine is the receiving side: it cannot open a connection to the other\n"
+                  "machine, so that machine syncs both ways itself (on every read, and in the\n"
+                  "background if `sync --install-schedule` was run there). Current mirrors:\n")
+        else:
+            print("No remote host configured. From the machine that can ssh into the other, run:\n"
+                  "  python sessions.py sync --host USER@HOST [--name REMOTE_NAME] [--as LOCAL_NAME]\n"
+                  "That pulls the remote's sessions here and pushes this machine's there.\n")
         _print_mirror_status()
         return
+    if args.batch:
+        _start_batch_log()
     remotes = cfg.setdefault("remotes", {})
     remote_name = _machine_slug(args.name or remotes.get(host) or host)
     local_name = _machine_slug(args.as_name or cfg.get("local_name") or socket.gethostname())
@@ -2856,7 +2965,7 @@ def cmd_sync(args):
                 _sync_pull(host, remote_name, args.dry_run)
             if not args.pull_only:
                 _sync_push(host, local_name, args.dry_run)
-        except (RuntimeError, OSError, tarfile.TarError) as e:
+        except (RuntimeError, OSError, tarfile.TarError, subprocess.SubprocessError) as e:
             print(f"sync failed: {e}", file=sys.stderr)
             sys.exit(1)
         if not args.dry_run:
@@ -2911,6 +3020,12 @@ def build_parser():
     py.add_argument("--push-only", action="store_true")
     py.add_argument("--dry-run", action="store_true", help="only report what would transfer")
     py.add_argument("--status", action="store_true", help="show mirrors and last sync times")
+    py.add_argument("--batch", action="store_true",
+                    help="background mode: never prompt for a password, log to ~/.session-mirrors/sync.log")
+    py.add_argument("--install-schedule", type=int, nargs="?", const=10, default=None, metavar="MINUTES",
+                    help="sync in the background every MINUTES (default 10); Windows Task Scheduler")
+    py.add_argument("--uninstall-schedule", action="store_true",
+                    help="remove the background sync")
     py.set_defaults(func=cmd_sync)
 
     pl = sub.add_parser("list", parents=[common], help="recent sessions, newest first")

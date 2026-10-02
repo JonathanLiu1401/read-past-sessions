@@ -71,6 +71,7 @@ python <skill_dir>/scripts/sessions.py sync --host jliu1401@linux-lab-101.ece.uw
 python <skill_dir>/scripts/sessions.py sync
 python <skill_dir>/scripts/sessions.py sync --status      # mirrors + last sync time
 python <skill_dir>/scripts/sessions.py sync --dry-run     # what would transfer
+python <skill_dir>/scripts/sessions.py sync --install-schedule 10   # background sync every 10 min
 ```
 
 **Auto-sync.** Once a host is configured, `list`, `search`, `show`,
@@ -81,6 +82,15 @@ ssh batch mode, so it never prompts; on any failure it prints one
 with `--no-sync` or `SESSIONS_AUTO_SYNC=0`; change the interval with
 `SESSIONS_AUTO_SYNC_MINUTES`. Do not run `sync` by hand before every read.
 
+**Background sync (so the server side stays fresh too).** The server cannot
+connect to the laptop, so the laptop must start every transfer. `sync
+--install-schedule [MINUTES]` (default 10) registers a Windows Task Scheduler
+job that runs `sync --batch` with `pythonw` (no window, never prompts, logs to
+`~/.session-mirrors/sync.log`); on Linux/macOS it prints a crontab line.
+`--uninstall-schedule` removes it. On the server, `sync` / `sync --status`
+show how old each mirror is, and reads print a `note:` on stderr when a mirror
+is more than an hour old.
+
 When the user asks about a session "on my laptop" / "on the lab computer":
 
 1. `sync --status` to see which mirrors exist and how fresh they are.
@@ -89,7 +99,8 @@ When the user asks about a session "on my laptop" / "on the lab computer":
    the user to set it up (README) or run `! python ... sync` themselves.
 3. If this is the server side (no host configured), the mirror is only as fresh
    as the other machine's last `sync`. Say how old it is and, if stale, ask the
-   user to run `sync` on that machine.
+   user to run `sync` on that machine, or `sync --install-schedule` there once
+   so it stays fresh on its own.
 4. Then `list` / `search` / `show` as usual, adding `--machine <name>` if useful.
 
 Mirrored transcripts carry the other machine's paths (`C:\Users\...` vs

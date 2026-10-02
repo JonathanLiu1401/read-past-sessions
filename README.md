@@ -89,6 +89,8 @@ python scripts/sessions.py sync --host jliu1401@linux-lab-101.ece.uw.edu --name 
 # afterwards
 python scripts/sessions.py sync
 python scripts/sessions.py sync --status
+# keep both sides fresh: sync in the background every 10 min (Windows Task Scheduler)
+python scripts/sessions.py sync --install-schedule 10
 ```
 
 Set up ssh key auth so `sync` runs without password prompts (Windows PowerShell):
